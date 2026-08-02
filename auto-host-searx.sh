@@ -6,7 +6,7 @@ set -euo pipefail
 # Description :
 #   - Met à jour le système
 #   - Installe Docker via le script officiel
-#   - Configure un DNS dynamique avec FreeDNS
+#   - Configure un DNS dynamique avec FreeDNS OU DuckDNS (choix au lancement)
 #   - Déploie SearXNG via Docker Compose sous /searx/
 #   - Configure Nginx en proxy inverse avec SSL (Let's Encrypt)
 #   - Pages statiques à la racine (/)
@@ -72,35 +72,92 @@ get_codename() {
 }
 
 # -----------------------------------------------------------------------------
+# Choix du DNS dynamique (FreeDNS ou DuckDNS)
+# -----------------------------------------------------------------------------
+choose_dns_provider() {
+    echo ""
+    echo -e "${C_BOLD}Choisissez votre fournisseur de DNS dynamique :${C_RESET}"
+    echo ""
+    echo "  1) FreeDNS (afraid.org) - Gratuit, domaines .mooo.com, .dynapoint.com..."
+    echo "  2) DuckDNS       - Gratuit, domaine .duckdns.org uniquement"
+    echo ""
+    read -rp "Votre choix [1-2] : " choice
+
+    case "$choice" in
+        1)
+            DNS_PROVIDER="freedns"
+            ;;
+        2)
+            DNS_PROVIDER="duckdns"
+            ;;
+        *)
+            log_error "Choix invalide. Veuillez sélectionner 1 ou 2."
+            ;;
+    esac
+
+    echo -e "${C_GREEN}→ Fournisseur sélectionné : ${DNS_PROVIDER}${C_RESET}"
+    echo ""
+}
+
+# -----------------------------------------------------------------------------
 # Fichier de configuration
 # -----------------------------------------------------------------------------
 generate_config_file() {
     if [[ -f "$CONF_FILE" ]]; then
         log_info "Fichier de configuration existant trouvé : $CONF_FILE"
         . "$CONF_FILE"
-        return
+        
+        # Vérifier si c'est un ancien format sans DNS_PROVIDER
+        if [[ -z "${DNS_PROVIDER:-}" ]]; then
+            log_warn "Fichier de configuration ancien (sans DNS_PROVIDER). Recréation..."
+            rm -f "$CONF_FILE"
+            choose_dns_provider
+        else
+            log_info "Fournisseur DNS : ${DNS_PROVIDER}"
+            return
+        fi
+    else
+        choose_dns_provider
     fi
-
-    log_step "Création du fichier de configuration"
 
     mkdir -p "$INSTALL_DIR"
 
-    cat > "$CONF_FILE" << 'EOF'
+    cat > "$CONF_FILE" << EOF
 # =============================================================
 # Fichier de configuration pour l'installation SearXNG
 # =============================================================
 
-# --- Domaine ---
+# --- DNS Dynamique ---
+DNS_PROVIDER="${DNS_PROVIDER}"
+
+# ${DNS_PROVIDER^} Configuration
+EOF
+
+    # Ajouter les champs spécifiques selon le provider
+    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
+        cat >> "$CONF_FILE" << 'EOF'
 # Votre nom de domaine FreeDNS (ex : monsite.mooo.com)
 DOMAIN=""
 
-# --- FreeDNS Dynamic DNS ---
-# Token récupéré sur https://freedns.afraid.org/dynamic/
-# Copiez UNIQUEMENT la partie après ? dans l'URL de mise à jour
+# Token FreeDNS (la partie après ? dans l'URL de mise à jour)
+# Récupéré sur https://freedns.afraid.org/dynamic/
 FREEDNS_TOKEN=""
+EOF
+    else
+        cat >> "$CONF_FILE" << 'EOF'
+# Sous-domaine DuckDNS (ex : monsite.duckdns.org)
+# Entrez seulement "monsite" (sans .duckdns.org)
+DUCKDNS_DOMAIN=""
 
-# Intervalles de mise à jour DNS (en minutes, 5 minimum recommandé)
-FREEDNS_UPDATE_INTERVAL=5
+# Token DuckDNS (généré sur le site DuckDNS)
+DUCKDNS_TOKEN=""
+EOF
+    fi
+
+    cat >> "$CONF_FILE" << 'EOF'
+
+# Intervalle de mise à jour DNS (en minutes, 5 minimum recommandé)
+DNS_UPDATE_INTERVAL=5
 
 # --- SearXNG ---
 # Nom de l'instance affiché dans l'interface
@@ -134,8 +191,15 @@ EOF
     echo "  sudo nano ${CONF_FILE}"
     echo ""
     echo "Champs obligatoires :"
-    echo "  - DOMAIN           : votre domaine FreeDNS"
-    echo "  - FREEDNS_TOKEN    : votre token FreeDNS"
+    
+    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
+        echo "  - DOMAIN           : votre domaine FreeDNS (ex: monsite.mooo.com)"
+        echo "  - FREEDNS_TOKEN    : votre token FreeDNS"
+    else
+        echo "  - DUCKDNS_DOMAIN   : votre sous-domaine DuckDNS (ex: monsite)"
+        echo "  - DUCKDNS_TOKEN    : votre token DuckDNS"
+    fi
+    
     echo "  - LE_EMAIL         : votre e-mail pour Let's Encrypt"
     echo ""
 
@@ -159,14 +223,31 @@ EOF
 validate_config() {
     local errors=0
 
-    if [[ -z "${DOMAIN:-}" ]]; then
-        echo -e "${C_RED}  ✗ DOMAIN est vide${C_RESET}"
-        errors=$((errors + 1))
-    fi
-
-    if [[ -z "${FREEDNS_TOKEN:-}" ]]; then
-        echo -e "${C_RED}  ✗ FREEDNS_TOKEN est vide${C_RESET}"
-        errors=$((errors + 1))
+    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
+        if [[ -z "${DOMAIN:-}" ]]; then
+            echo -e "${C_RED}  ✗ DOMAIN est vide${C_RESET}"
+            errors=$((errors + 1))
+        fi
+        if [[ -z "${FREEDNS_TOKEN:-}" ]]; then
+            echo -e "${C_RED}  ✗ FREEDNS_TOKEN est vide${C_RESET}"
+            errors=$((errors + 1))
+        fi
+    else
+        if [[ -z "${DUCKDNS_DOMAIN:-}" ]]; then
+            echo -e "${C_RED}  ✗ DUCKDNS_DOMAIN est vide${C_RESET}"
+            errors=$((errors + 1))
+        fi
+        if [[ -z "${DUCKDNS_TOKEN:-}" ]]; then
+            echo -e "${C_RED}  ✗ DUCKDNS_TOKEN est vide${C_RESET}"
+            errors=$((errors + 1))
+        fi
+        
+        # Ajouter .duckdns.org au domaine si manquant
+        if [[ ! "$DUCKDNS_DOMAIN" =~ \.duckdns\.org$ ]]; then
+            DOMAIN="${DUCKDNS_DOMAIN}.duckdns.org"
+        else
+            DOMAIN="$DUCKDNS_DOMAIN"
+        fi
     fi
 
     if [[ -z "${LE_EMAIL:-}" ]]; then
@@ -178,7 +259,7 @@ validate_config() {
         log_error "Configuration incomplète. Éditez $CONF_FILE et relancez le script."
     fi
 
-    log_info "Configuration validée : domaine=$DOMAIN | prefixe=${SEARX_PREFIX}"
+    log_info "Configuration validée : domaine=$DOMAIN | provider=${DNS_PROVIDER}"
 }
 
 # -----------------------------------------------------------------------------
@@ -255,7 +336,7 @@ setup_freedns() {
 # Généré par install.sh
 
 FREEDNS_TOKEN="${FREEDNS_TOKEN}"
-LOG_FILE="/var/log/freedns-update.log"
+LOG_FILE="/var/log/dns-update.log"
 
 CURRENT_IP=\$(curl -s https://api.ipify.org 2>/dev/null)
 
@@ -285,14 +366,88 @@ EOF
     bash "$SCRIPT_PATH" || log_warn "La première mise à jour DNS a échoué (vérifiez le token)"
 
     # Tâche cron
-    local INTERVAL="${FREEDNS_UPDATE_INTERVAL:-5}"
+    local INTERVAL="${DNS_UPDATE_INTERVAL:-5}"
     ( crontab -l 2>/dev/null | grep -v "$CRON_LABEL" ; \
       echo "$CRON_LABEL" ; \
       echo "*/${INTERVAL} * * * * ${SCRIPT_PATH}" ) \
         | crontab -
 
     log_info "FreeDNS configuré (mise à jour toutes les ${INTERVAL} min)"
-    log_info "Logs : /var/log/freedns-update.log"
+    log_info "Logs : /var/log/dns-update.log"
+}
+
+# -----------------------------------------------------------------------------
+# Étape 4 bis : Configuration du DNS dynamique DuckDNS
+# -----------------------------------------------------------------------------
+setup_duckdns() {
+    log_step "Configuration du DNS dynamique DuckDNS"
+
+    local SCRIPT_PATH="/usr/local/bin/duckdns-update.sh"
+    local CRON_LABEL="# DuckDNS dynamic DNS update"
+
+    # Script de mise à jour
+    cat > "$SCRIPT_PATH" << EOF
+#!/bin/bash
+# Mise à jour automatique de l'IP chez DuckDNS
+# Généré par install.sh
+
+DUCKDNS_DOMAIN="${DUCKDNS_DOMAIN}"
+DUCKDNS_TOKEN="${DUCKDNS_TOKEN}"
+LOG_FILE="/var/log/dns-update.log"
+
+CURRENT_IP=\$(curl -s https://api.ipify.org 2>/dev/null)
+
+if [[ -z "\$CURRENT_IP" ]]; then
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ERREUR : Impossible de récupérer l'IP publique" >> "\$LOG_FILE"
+    exit 1
+fi
+
+RESULT=\$(curl -s "https://www.duckdns.org/update?domains=\${DUCKDNS_DOMAIN}&token=\${DUCKDNS_TOKEN}&ip=\${CURRENT_IP}" 2>/dev/null)
+
+echo "[\$(date '+%Y-%m-%d %H:%M:%S')] IP=\$CURRENT_IP | Réponse: \$RESULT" >> "\$LOG_FILE"
+
+case "\$RESULT" in
+    "OK")
+        # OK
+        ;;
+    *)
+        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ATTENTION : Réponse inattendue de DuckDNS (\$RESULT)" >> "\$LOG_FILE"
+        ;;
+esac
+EOF
+
+    chmod +x "$SCRIPT_PATH"
+
+    # Première exécution immédiate
+    log_info "Première mise à jour DNS..."
+    bash "$SCRIPT_PATH" || log_warn "La première mise à jour DNS a échoué (vérifiez le token)"
+
+    # Tâche cron
+    local INTERVAL="${DNS_UPDATE_INTERVAL:-5}"
+    ( crontab -l 2>/dev/null | grep -v "$CRON_LABEL" ; \
+      echo "$CRON_LABEL" ; \
+      echo "*/${INTERVAL} * * * * ${SCRIPT_PATH}" ) \
+        | crontab -
+
+    log_info "DuckDNS configuré (mise à jour toutes les ${INTERVAL} min)"
+    log_info "Logs : /var/log/dns-update.log"
+}
+
+# -----------------------------------------------------------------------------
+# Wrapper DNS dynamique (appelle Freedns ou Duckdns selon le choix)
+# -----------------------------------------------------------------------------
+setup_dns_dynamic() {
+    case "$DNS_PROVIDER" in
+        freedns)
+            setup_freedns
+            ;;
+        duckdns)
+            setup_duckdns
+            ;;
+        *)
+            log_error "Fournisseur DNS non reconnu : $DNS_PROVIDER"
+            ;;
+    esac
 }
 
 # -----------------------------------------------------------------------------
@@ -771,11 +926,11 @@ final_checks() {
         FAIL=$((FAIL + 1))
     fi
 
-    if crontab -l 2>/dev/null | grep -q "freedns-update"; then
-        echo -e "  ${C_GREEN}✓${C_RESET} FreeDNS DNS dynamique : cron actif"
+    if crontab -l 2>/dev/null | grep -q "dns-update"; then
+        echo -e "  ${C_GREEN}✓${C_RESET} DNS dynamique (${DNS_PROVIDER}) : cron actif"
         OK=$((OK + 1))
     else
-        echo -e "  ${C_RED}✗${C_RESET} FreeDNS DNS dynamique : cron manquant"
+        echo -e "  ${C_RED}✗${C_RESET} DNS dynamique : cron manquant"
         FAIL=$((FAIL + 1))
     fi
 
@@ -806,7 +961,7 @@ ${C_BOLD}Services installés :${C_RESET}
   • Nginx            $(nginx -v 2>&1 | awk -F/ '{print $2}')
   • SearXNG          $(docker compose -f "$INSTALL_DIR/docker-compose.yml" images 2>/dev/null | grep searxng | awk '{print $2}')
   • Certbot          $(certbot --version 2>/dev/null | awk '{print $2}')
-  • FreeDNS          Cron actif (toutes les ${FREEDNS_UPDATE_INTERVAL} min)
+  • DNS dynamique    ${DNS_PROVIDER} (toutes les ${DNS_UPDATE_INTERVAL} min)
 
 ${C_BOLD}Fichiers importants :${C_RESET}
   • Config générale   : ${CONF_FILE}
@@ -814,7 +969,7 @@ ${C_BOLD}Fichiers importants :${C_RESET}
   • SearXNG settings  : ${INSTALL_DIR}/settings.yml
   • Nginx             : ${NGINX_CONF}
   • Certificats SSL   : /etc/letsencrypt/live/${DOMAIN}/
-  • Log FreeDNS       : /var/log/freedns-update.log
+  • Log DNS           : /var/log/dns-update.log
   • Pages statiques   : ${STATIC_ROOT}/
 
 ${C_BOLD}Commandes utiles :${C_RESET}
@@ -823,7 +978,7 @@ ${C_BOLD}Commandes utiles :${C_RESET}
   • Logs Nginx       : journalctl -u nginx -f
   • Tester SSL       : curl -I https://${DOMAIN}/
   • Renouveler certif: sudo certbot renew --dry-run
-  • Logs FreeDNS     : tail -f /var/log/freedns-update.log
+  • Logs DNS         : tail -f /var/log/dns-update.log
 
 ${C_YELLOW}${C_BOLD}Pensez à ouvrir les ports 80 et 443 sur votre routeur/box${C_RESET}
 ${C_YELLOW}vers l'IP locale du Raspberry Pi : ${LOCAL_IP}${C_RESET}
@@ -837,6 +992,11 @@ ${C_BOLD}Architecture :${C_RESET}
   /            → pages statiques (${STATIC_ROOT}/)
   ${SEARX_PREFIX}/         → SearXNG (proxy inverse)
 
+${C_BOLD}DNS dynamique (${DNS_PROVIDER}):${C_RESET}
+  - Domain  : ${DOMAIN}
+  - Update  : /usr/local/bin/*dns-update.sh (cron */${DNS_UPDATE_INTERVAL})
+  - Log     : /var/log/dns-update.log
+
 EOF
 }
 
@@ -847,14 +1007,14 @@ main() {
     echo -e "${C_CYAN}${C_BOLD}"
     echo "╔══════════════════════════════════════════════╗"
     echo "║  Installation Docker + SearXNG + Nginx (RPi) ║"
-    echo "║  avec FreeDNS + Let's Encrypt                ║"
+    echo "║  avec DNS dynamique + Let's Encrypt          ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${C_RESET}"
 
     check_root
     check_raspberry_pi
 
-    # Génère ou charge la configuration AVANT toute chose
+    # Génère ou charge la configuration AVANT toute chose (avec choix DNS)
     generate_config_file
 
     # Étapes d'installation
@@ -862,7 +1022,7 @@ main() {
     install_docker
     install_nginx
     setup_static_pages
-    setup_freedns
+    setup_dns_dynamic
     setup_searxng
     start_searxng
     configure_nginx_http
