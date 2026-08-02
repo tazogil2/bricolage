@@ -6,7 +6,7 @@ Auteur : Généré par *Lumo*
 
 - Met à jour le système
 - Installe Docker, Nginx
-- Configure un DNS dynamique avec FreeDNS
+- Configure un DNS dynamique avec FreeDNS ou DuckDNS
 - Déploie SearXNG via Docker Compose
 - Configure Nginx en proxy inverse avec SSL (Let's Encrypt)
 
@@ -24,16 +24,6 @@ Aller dans le dossier téléchargé :
 Rendre le script exécutable : 
 
     chmod 700 auto-host-searx.sh
-
-
-Trouver le token FreeDNS : 
-
-1. Connectez-vous sur freedns.afraid.org
-2. Allez dans Subdomains → Dynamic DNS
-3. Cliquez sur votre sous-domaine pour voir l'URL de mise à jour, qui ressemble
-à :https://freedns.afraid.org/dynamic/update.php?a1b2c3d4e5f6g7h8i9j0…
-4. Copiez **tout ce qui est après `?`** → c'est votre `FREEDNS_TOKEN`
-
 
 Exécuter le script : 
 
