@@ -56,4 +56,19 @@ Autres champs optionnels :
 
 Relancer le script après l'édition de la configuration : 
 
-    sudo ./auto-host-searx.sh
+Ouvertures réseau :
+
+|---Port---|---Destination---|
+|------|------|
+|80	| Routeur → IP RPi |
+| 443	| Routeur → IP RPi |
+
+Points d'attention :
+
+|Élément | Vérification |
+|---|---|
+|url_prefix	| Vérifié dans settings.yml |
+|proxy_pass	| Pas de ${SEARX_PREFIX} inclus |
+|Routes bloquées |	/config et /stats renvoie 404 |
+|Statiques	| / sert depuis ${STATIC_ROOT} |
+|SearXNG	| ${SEARX_PREFIX}/ sert via proxy |
