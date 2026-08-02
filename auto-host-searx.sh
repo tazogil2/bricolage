@@ -187,51 +187,33 @@ system_update() {
 # Étape 2 : Installation de Docker (adapté Raspberry Pi / ARM)
 # -----------------------------------------------------------------------------
 install_docker() {
-  log_step "Installation de Docker"
-
-  # Dépendances
-  apt-get install -y -qq \
-    ca-certificates curl gnupg lsb-release apt-transport-https \
-    software-properties-common openssl >/dev/null 2>&1
-
-  # Clé GPG Docker
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/debian/gpg" |
-    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-
-  # Dépôt Docker (utilise le codename Debian — RPi OS est basé sur Debian)
-  local CODENAME
-  CODENAME=$(get_codename)
-  local ARCH
-  ARCH="$(dpkg --print-architecture)"
-
-  echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/debian ${CODENAME} stable" |
-    tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-  apt-get update -qq
-  apt-get install -y -qq \
-    docker-ce docker-ce-cli containerd.io \
-    docker-buildx-plugin docker-compose-plugin >/dev/null 2>&1
-
-  # Activer et démarrer
-  systemctl enable docker.service
-  systemctl start docker
-
-  # Ajouter l'utilisateur courant au groupe docker (si non-root original)
-  local REAL_USER="${SUDO_USER:-}"
-  if [[ -n "$REAL_USER" ]]; then
-    usermod -aG docker "$REAL_USER"
-    log_info "Utilisateur '$REAL_USER' ajouté au groupe docker"
-  fi
-
-  # Vérification
-  if docker info >/dev/null 2>&1; then
-    log_info "Docker fonctionne correctement"
-  else
-    log_error "Docker ne démarre pas. Vérifiez les logs : journalctl -u docker"
-  fi
+    log_step "Installation de Docker"
+    
+    # 1. Pré-requis
+    apt-get update -y
+    apt-get install -y -qq \
+        ca-certificates curl gnupg lsb-release \
+        software-properties-common >/dev/null 2>&1
+    
+    # 2. Exécuter le script officiel (plus robuste et maintenu)
+    curl -fsSL https://get.docker.com | sh
+    
+    # 3. Ajouter l'utilisateur au groupe docker
+    if [[ -n "$SUDO_USER" ]]; then
+        usermod -aG docker "$SUDO_USER"
+        log_info "Utilisateur '$SUDO_USER' ajouté au groupe docker"
+    fi
+    
+    # 4. Démarrer et activer
+    systemctl enable docker.service
+    systemctl start docker
+    
+    # 5. Vérification
+    if docker info >/dev/null 2>&1; then
+        log_info "Docker installé avec succès via le script officiel"
+    else
+        log_error "Docker ne démarre pas : journalctl -u docker"
+    fi
 }
 
 # -----------------------------------------------------------------------------
