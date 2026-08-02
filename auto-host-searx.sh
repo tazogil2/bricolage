@@ -1,538 +1,137 @@
 #!/bin/bash
-set -euo pipefail
 
-# =============================================================================
-# Script d'installation : Docker + SearXNG + Nginx (HTTPS) sur Raspberry Pi
-# Description :
-#   - Met à jour le système
-#   - Installe Docker via le script officiel
-#   - Configure un DNS dynamique avec FreeDNS OU DuckDNS (choix au lancement)
-#   - Déploie SearXNG via Docker Compose sous /searx/
-#   - Configure Nginx en proxy inverse avec SSL (Let's Encrypt)
-#   - Pages statiques à la racine (/)
-# =============================================================================
+# install_searx_rpi.sh
+# Installation de SearXNG sur Raspberry Pi avec :
+#   - Choix DNS dynamique : DuckDNS ou FreeDNS
+#   - Reverse proxy Nginx + HTTPS (Let's Encrypt)
+# Auteur : tazogil2 assisté de Lumo / Projet bricolage
+# Date : 2026-08-02
 
-# -----------------------------------------------------------------------------
-# Couleurs et fonctions de logging
-# -----------------------------------------------------------------------------
-C_RED='\033[0;31m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[1;33m'
-C_CYAN='\033[0;36m'
-C_BOLD='\033[1m'
-C_RESET='\033[0m'
+set -e
 
-log_info()  { echo -e "${C_GREEN}[INFO]${C_RESET} $1"; }
-log_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $1"; }
-log_step()  { echo -e "\n${C_CYAN}${C_BOLD}=== $1 ===${C_RESET}\n"; }
-log_error() { echo -e "${C_RED}[ERROR]${C_RESET} $1"; exit 1; }
+# ── Couleurs ──────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# -----------------------------------------------------------------------------
-# Variables globales
-# -----------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="/opt/searxng"
-CONF_FILE="${INSTALL_DIR}/install.conf"
-NGINX_CONF="/etc/nginx/sites-available/searxng"
+# ── Variables globales ────────────────────────────────────
+PROJECT_DIR="/opt/searxng"
 SEARX_PORT=8080
-SEARX_PREFIX="/searx"
-STATIC_ROOT="/var/www/html"
+HTTP_PORT=80
+HTTPS_PORT=443
 
-# -----------------------------------------------------------------------------
-# Vérifications pré-requis
-# -----------------------------------------------------------------------------
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        log_error "Ce script doit être exécuté en tant que root (utilisez sudo)."
-    fi
-}
+echo -e "${CYAN}"
+echo "================================================="
+echo "   Installation de SearXNG sur Raspberry Pi"
+echo "   avec Nginx + HTTPS (Let's Encrypt)"
+echo "================================================="
+echo -e "${NC}"
 
-check_raspberry_pi() {
-    local ARCH
-    ARCH=$(uname -m)
-    
-    # Tentative de détection du modèle
-    local BOARD_MODEL=""
-    if [[ -f /proc/device-tree/model ]]; then
-        BOARD_MODEL=$(tr -d '\0' < /proc/device-tree/model)
-    elif grep -qi "^Model" /proc/cpuinfo 2>/dev/null; then
-        BOARD_MODEL=$(grep -i "^Model" /proc/cpuinfo | cut -d':' -f2 | xargs)
-    fi
+# ── 1. Vérification des privilèges ───────────────────────
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Ce script doit être lancé avec sudo.${NC}"
+    echo "Utilisez : sudo bash $0"
+    exit 1
+fi
 
-    if echo "$BOARD_MODEL" | grep -qi "raspberry"; then
-        log_info "Raspberry Pi détecté : ${BOARD_MODEL} (${ARCH})"
-    else
-        log_warn "Carte non identifiée (« ${BOARD_MODEL:-inconnue} ») mais architecture ${ARCH}. Le script continue."
-    fi
-}
+# ── 2. Détection de l'utilisateur principal ──────────────
+REAL_USER="${SUDO_USER:-$USER}"
+echo -e "${YELLOW}Utilisateur détecté : ${REAL_USER}${NC}"
 
-get_codename() {
-    . /etc/os-release
-    echo "${VERSION_CODENAME:-bookworm}"
-}
+# ── 3. Mise à jour du système ────────────────────────────
+echo -e "${YELLOW}[1/8] Mise à jour du système...${NC}"
+apt update && apt upgrade -y
 
-# -----------------------------------------------------------------------------
-# Choix du DNS dynamique (FreeDNS ou DuckDNS)
-# -----------------------------------------------------------------------------
-choose_dns_provider() {
-    echo ""
-    echo -e "${C_BOLD}Choisissez votre fournisseur de DNS dynamique :${C_RESET}"
-    echo ""
-    echo "  1) FreeDNS (afraid.org) - Gratuit, domaines .mooo.com, .dynapoint.com..."
-    echo "  2) DuckDNS       - Gratuit, domaine .duckdns.org uniquement"
-    echo ""
-    read -rp "Votre choix [1-2] : " choice
+# ── 4. Installation des dépendances ───────────────────────
+echo -e "${YELLOW}[2/8] Installation des dépendances...${NC}"
+apt install -y git curl jq openssl ufw \
+    nginx certbot python3-certbot-nginx
 
-    case "$choice" in
-        1)
-            DNS_PROVIDER="freedns"
-            ;;
-        2)
-            DNS_PROVIDER="duckdns"
-            ;;
-        *)
-            log_error "Choix invalide. Veuillez sélectionner 1 ou 2."
-            ;;
-    esac
-
-    echo -e "${C_GREEN}→ Fournisseur sélectionné : ${DNS_PROVIDER}${C_RESET}"
-    echo ""
-}
-
-# -----------------------------------------------------------------------------
-# Fichier de configuration
-# -----------------------------------------------------------------------------
-generate_config_file() {
-    if [[ -f "$CONF_FILE" ]]; then
-        log_info "Fichier de configuration existant trouvé : $CONF_FILE"
-        . "$CONF_FILE"
-        
-        # Vérifier si c'est un ancien format sans DNS_PROVIDER
-        if [[ -z "${DNS_PROVIDER:-}" ]]; then
-            log_warn "Fichier de configuration ancien (sans DNS_PROVIDER). Recréation..."
-            rm -f "$CONF_FILE"
-            choose_dns_provider
-        else
-            log_info "Fournisseur DNS : ${DNS_PROVIDER}"
-            return
-        fi
-    else
-        choose_dns_provider
-    fi
-
-    mkdir -p "$INSTALL_DIR"
-
-    cat > "$CONF_FILE" << EOF
-# =============================================================
-# Fichier de configuration pour l'installation SearXNG
-# =============================================================
-
-# --- DNS Dynamique ---
-DNS_PROVIDER="${DNS_PROVIDER}"
-
-# ${DNS_PROVIDER^} Configuration
-EOF
-
-    # Ajouter les champs spécifiques selon le provider
-    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
-        cat >> "$CONF_FILE" << 'EOF'
-# Votre nom de domaine FreeDNS (ex : monsite.mooo.com)
-DOMAIN=""
-
-# Token FreeDNS (la partie après ? dans l'URL de mise à jour)
-# Récupéré sur https://freedns.afraid.org/dynamic/
-FREEDNS_TOKEN=""
-EOF
-    else
-        cat >> "$CONF_FILE" << 'EOF'
-# Sous-domaine DuckDNS (ex : monsite.duckdns.org)
-# Entrez seulement "monsite" (sans .duckdns.org)
-DUCKDNS_DOMAIN=""
-
-# Token DuckDNS (généré sur le site DuckDNS)
-DUCKDNS_TOKEN=""
-EOF
-    fi
-
-    cat >> "$CONF_FILE" << 'EOF'
-
-# Intervalle de mise à jour DNS (en minutes, 5 minimum recommandé)
-DNS_UPDATE_INTERVAL=5
-
-# --- SearXNG ---
-# Nom de l'instance affiché dans l'interface
-SEARX_INSTANCE_NAME="SearXNG"
-# Langue par défaut
-SEARX_LANG="fr"
-# Port interne du conteneur Docker
-SEARX_PORT=8080
-# Préfixe du sous-dossier (ex: /searx, /search, etc.)
-SEARX_PREFIX="/searx"
-
-# --- Let's Encrypt ---
-# Adresse e-mail pour les notifications Let's Encrypt
-LE_EMAIL=""
-
-# --- Pages statiques ---
-# Titre de la page d'accueil statique
-STATIC_TITLE="Bienvenue"
-
-# --- Nginx ---
-# Rediriger tout le trafic HTTP vers HTTPS
-FORCE_HTTPS=true
-EOF
-
-    chmod 600 "$CONF_FILE"
-
-    echo ""
-    echo -e "${C_YELLOW}${C_BOLD}Le fichier de configuration a été créé : ${CONF_FILE}${C_RESET}"
-    echo -e "${C_YELLOW}Veuillez l'éditer avec vos informations avant de relancer le script.${C_RESET}"
-    echo ""
-    echo "  sudo nano ${CONF_FILE}"
-    echo ""
-    echo "Champs obligatoires :"
-    
-    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
-        echo "  - DOMAIN           : votre domaine FreeDNS (ex: monsite.mooo.com)"
-        echo "  - FREEDNS_TOKEN    : votre token FreeDNS"
-    else
-        echo "  - DUCKDNS_DOMAIN   : votre sous-domaine DuckDNS (ex: monsite)"
-        echo "  - DUCKDNS_TOKEN    : votre token DuckDNS"
-    fi
-    
-    echo "  - LE_EMAIL         : votre e-mail pour Let's Encrypt"
-    echo ""
-
-    # Édition interactive
-    read -rp "Voulez-vous éditer le fichier maintenant ? [O/n] " choice
-    case "${choice:-O}" in
-        [OoYy]*)
-            ${EDITOR:-nano} "$CONF_FILE"
-            ;;
-        *)
-            log_error "Veuillez éditer $CONF_FILE puis relancer le script."
-            ;;
-    esac
-
-    . "$CONF_FILE"
-
-    # Validation des champs obligatoires
-    validate_config
-}
-
-validate_config() {
-    local errors=0
-
-    if [[ "$DNS_PROVIDER" == "freedns" ]]; then
-        if [[ -z "${DOMAIN:-}" ]]; then
-            echo -e "${C_RED}  ✗ DOMAIN est vide${C_RESET}"
-            errors=$((errors + 1))
-        fi
-        if [[ -z "${FREEDNS_TOKEN:-}" ]]; then
-            echo -e "${C_RED}  ✗ FREEDNS_TOKEN est vide${C_RESET}"
-            errors=$((errors + 1))
-        fi
-    else
-        if [[ -z "${DUCKDNS_DOMAIN:-}" ]]; then
-            echo -e "${C_RED}  ✗ DUCKDNS_DOMAIN est vide${C_RESET}"
-            errors=$((errors + 1))
-        fi
-        if [[ -z "${DUCKDNS_TOKEN:-}" ]]; then
-            echo -e "${C_RED}  ✗ DUCKDNS_TOKEN est vide${C_RESET}"
-            errors=$((errors + 1))
-        fi
-        
-        # Ajouter .duckdns.org au domaine si manquant
-        if [[ ! "$DUCKDNS_DOMAIN" =~ \.duckdns\.org$ ]]; then
-            DOMAIN="${DUCKDNS_DOMAIN}.duckdns.org"
-        else
-            DOMAIN="$DUCKDNS_DOMAIN"
-        fi
-    fi
-
-    if [[ -z "${LE_EMAIL:-}" ]]; then
-        echo -e "${C_RED}  ✗ LE_EMAIL est vide${C_RESET}"
-        errors=$((errors + 1))
-    fi
-
-    if [[ $errors -gt 0 ]]; then
-        log_error "Configuration incomplète. Éditez $CONF_FILE et relancez le script."
-    fi
-
-    log_info "Configuration validée : domaine=$DOMAIN | provider=${DNS_PROVIDER}"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 1 : Mise à jour du système
-# -----------------------------------------------------------------------------
-system_update() {
-    log_step "Mise à jour du système"
-
-    apt-get update -y
-    apt-get full-upgrade -y
-    apt-get autoremove -y
-    apt-get autoclean -y
-
-    log_info "Système mis à jour"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 2 : Installation de Docker (via script officiel)
-# -----------------------------------------------------------------------------
-install_docker() {
-    log_step "Installation de Docker (via script officiel)"
-
-    # Dépendances
-    apt-get install -y -qq \
-        ca-certificates curl gnupg lsb-release apt-transport-https \
-        software-properties-common openssl >/dev/null 2>&1
-
-    # Exécuter le script officiel Docker (maintenu, auto-détecte l'OS)
-    curl -fsSL https://get.docker.com | sh
-
-    # Démarrer et activer
-    systemctl enable docker.service
+# ── 5. Installation de Docker (si absent) ─────────────────
+echo -e "${YELLOW}[3/8] Vérification de Docker...${NC}"
+if ! command -v docker &> /dev/null; then
+    echo -e "${YELLOW}Docker non détecté. Installation en cours...${NC}"
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    sh /tmp/get-docker.sh
+    rm /tmp/get-docker.sh
+    usermod -aG docker "$REAL_USER"
+    systemctl enable docker
     systemctl start docker
-
-    # Ajouter l'utilisateur au groupe docker
-    if [[ -n "$SUDO_USER" ]]; then
-        usermod -aG docker "$SUDO_USER"
-        log_info "Utilisateur '$SUDO_USER' ajouté au groupe docker"
-    fi
-
-    # Vérification
-    if docker info >/dev/null 2>&1; then
-        log_info "Docker installé avec succès (version : $(docker --version | awk '{print $3}' | tr -d ','))"
-    else
-        log_error "Docker ne démarre pas. Vérifiez les logs : journalctl -u docker"
-    fi
-}
-
-# -----------------------------------------------------------------------------
-# Étape 3 : Installation de Nginx
-# -----------------------------------------------------------------------------
-install_nginx() {
-    log_step "Installation de Nginx"
-
-    apt-get install -y -qq nginx >/dev/null 2>&1
-    systemctl enable nginx.service
-
-    log_info "Nginx installé (version : $(nginx -v 2>&1 | awk -F/ '{print $2}'))"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 4 : Configuration du DNS dynamique FreeDNS
-# -----------------------------------------------------------------------------
-setup_freedns() {
-    log_step "Configuration du DNS dynamique FreeDNS"
-
-    local SCRIPT_PATH="/usr/local/bin/freedns-update.sh"
-    local CRON_LABEL="# FreeDNS dynamic DNS update"
-
-    # Script de mise à jour
-    cat > "$SCRIPT_PATH" << EOF
-#!/bin/bash
-# Mise à jour automatique de l'IP chez FreeDNS
-# Généré par install.sh
-
-FREEDNS_TOKEN="${FREEDNS_TOKEN}"
-LOG_FILE="/var/log/dns-update.log"
-
-CURRENT_IP=\$(curl -s https://api.ipify.org 2>/dev/null)
-
-if [[ -z "\$CURRENT_IP" ]]; then
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ERREUR : Impossible de récupérer l'IP publique" >> "\$LOG_FILE"
-    exit 1
+    echo -e "${GREEN}Docker installé.${NC}"
+else
+    echo -e "${GREEN}Docker déjà présent.${NC}"
 fi
 
-RESULT=\$(curl -s "https://freedns.afraid.org/dynamic/update.php?\${FREEDNS_TOKEN}" 2>/dev/null)
-
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] IP=\$CURRENT_IP | Réponse: \$RESULT" >> "\$LOG_FILE"
-
-case "\$RESULT" in
-    *updated*|*has not changed*)
-        # OK
-        ;;
-    *)
-        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ATTENTION : Réponse inattendue de FreeDNS" >> "\$LOG_FILE"
-        ;;
-esac
-EOF
-
-    chmod +x "$SCRIPT_PATH"
-
-    # Première exécution immédiate
-    log_info "Première mise à jour DNS..."
-    bash "$SCRIPT_PATH" || log_warn "La première mise à jour DNS a échoué (vérifiez le token)"
-
-    # Tâche cron
-    local INTERVAL="${DNS_UPDATE_INTERVAL:-5}"
-    ( crontab -l 2>/dev/null | grep -v "$CRON_LABEL" ; \
-      echo "$CRON_LABEL" ; \
-      echo "*/${INTERVAL} * * * * ${SCRIPT_PATH}" ) \
-        | crontab -
-
-    log_info "FreeDNS configuré (mise à jour toutes les ${INTERVAL} min)"
-    log_info "Logs : /var/log/dns-update.log"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 4 bis : Configuration du DNS dynamique DuckDNS
-# -----------------------------------------------------------------------------
-setup_duckdns() {
-    log_step "Configuration du DNS dynamique DuckDNS"
-
-    local SCRIPT_PATH="/usr/local/bin/duckdns-update.sh"
-    local CRON_LABEL="# DuckDNS dynamic DNS update"
-
-    # Script de mise à jour
-    cat > "$SCRIPT_PATH" << EOF
-#!/bin/bash
-# Mise à jour automatique de l'IP chez DuckDNS
-# Généré par install.sh
-
-DUCKDNS_DOMAIN="${DUCKDNS_DOMAIN}"
-DUCKDNS_TOKEN="${DUCKDNS_TOKEN}"
-LOG_FILE="/var/log/dns-update.log"
-
-CURRENT_IP=\$(curl -s https://api.ipify.org 2>/dev/null)
-
-if [[ -z "\$CURRENT_IP" ]]; then
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ERREUR : Impossible de récupérer l'IP publique" >> "\$LOG_FILE"
-    exit 1
+# Docker Compose plugin
+if ! docker compose version &> /dev/null; then
+    echo -e "${YELLOW}Installation du plugin Docker Compose...${NC}"
+    apt install -y docker-compose-plugin
 fi
 
-RESULT=\$(curl -s "https://www.duckdns.org/update?domains=\${DUCKDNS_DOMAIN}&token=\${DUCKDNS_TOKEN}&ip=\${CURRENT_IP}" 2>/dev/null)
+# ── 6. Choix du service DNS ──────────────────────────────
+echo ""
+echo -e "${CYAN}Choisissez votre service DNS dynamique :${NC}"
+echo "  1) DuckDNS  (ex : monsearx.duckdns.org)"
+echo "  2) FreeDNS  (afraid.org)"
+echo ""
+read -p "Votre choix (1 ou 2) : " dns_choice
 
-echo "[\$(date '+%Y-%m-%d %H:%M:%S')] IP=\$CURRENT_IP | Réponse: \$RESULT" >> "\$LOG_FILE"
+DDNS_DOMAIN=""
+DDNS_TOKEN=""
+DDNS_UPDATE_URL=""
+SERVICE_TYPE=""
 
-case "\$RESULT" in
-    "OK")
-        # OK
+case "$dns_choice" in
+    1)
+        SERVICE_TYPE="duckdns"
+        echo -e "${GREEN}--- Configuration DuckDNS ---${NC}"
+        read -p "Sous-domaine DuckDNS (ex : monsearx) : " DDNS_SUBDOMAIN
+        DDNS_DOMAIN="${DDNS_SUBDOMAIN}.duckdns.org"
+        read -p "Token DuckDNS : " DDNS_TOKEN
+        ;;
+    2)
+        SERVICE_TYPE="freedns"
+        echo -e "${GREEN}--- Configuration FreeDNS ---${NC}"
+        read -p "Nom de domaine FreeDNS complet (ex : monsearx.mooo.com) : " DDNS_DOMAIN
+        read -p "URL de mise à jour FreeDNS (depuis Dynamic DNS > Direct URL) : " DDNS_UPDATE_URL
         ;;
     *)
-        echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ATTENTION : Réponse inattendue de DuckDNS (\$RESULT)" >> "\$LOG_FILE"
+        echo -e "${RED}Choix invalide. Abandon.${NC}"
+        exit 1
         ;;
 esac
+
+echo -e "${GREEN}Domaine utilisé : ${DDNS_DOMAIN}${NC}"
+
+# ── 7. Création du répertoire projet ─────────────────────
+echo -e "${YELLOW}[4/8] Création du répertoire projet...${NC}"
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# ── 8. Configuration .env ────────────────────────────────
+echo -e "${YELLOW}[5/8] Génération des fichiers de configuration...${NC}"
+
+SEARX_SECRET=$(openssl rand -hex 32)
+
+cat <<EOF > .env
+# ── SearXNG ───────────────────────────
+SEARXNG_SECRET_KEY=${SEARX_SECRET}
+SEARXNG_BASE_URL=https://${DDNS_DOMAIN}/
+
+# ── DNS Dynamique ─────────────────────
+DDNS_PROVIDER=${SERVICE_TYPE}
+DDNS_DOMAIN=${DDNS_DOMAIN}
+DDNS_TOKEN=${DDNS_TOKEN}
+DDNS_UPDATE_URL=${DDNS_UPDATE_URL}
 EOF
 
-    chmod +x "$SCRIPT_PATH"
+chmod 600 .env
 
-    # Première exécution immédiate
-    log_info "Première mise à jour DNS..."
-    bash "$SCRIPT_PATH" || log_warn "La première mise à jour DNS a échoué (vérifiez le token)"
-
-    # Tâche cron
-    local INTERVAL="${DNS_UPDATE_INTERVAL:-5}"
-    ( crontab -l 2>/dev/null | grep -v "$CRON_LABEL" ; \
-      echo "$CRON_LABEL" ; \
-      echo "*/${INTERVAL} * * * * ${SCRIPT_PATH}" ) \
-        | crontab -
-
-    log_info "DuckDNS configuré (mise à jour toutes les ${INTERVAL} min)"
-    log_info "Logs : /var/log/dns-update.log"
-}
-
-# -----------------------------------------------------------------------------
-# Wrapper DNS dynamique (appelle Freedns ou Duckdns selon le choix)
-# -----------------------------------------------------------------------------
-setup_dns_dynamic() {
-    case "$DNS_PROVIDER" in
-        freedns)
-            setup_freedns
-            ;;
-        duckdns)
-            setup_duckdns
-            ;;
-        *)
-            log_error "Fournisseur DNS non reconnu : $DNS_PROVIDER"
-            ;;
-    esac
-}
-
-# -----------------------------------------------------------------------------
-# Étape 5 : Création des pages statiques
-# -----------------------------------------------------------------------------
-setup_static_pages() {
-    log_step "Création des pages statiques à la racine"
-
-    mkdir -p "$STATIC_ROOT"
-
-    cat > "$STATIC_ROOT/index.html" << EOF
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${STATIC_TITLE:-Bienvenue}</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
-            margin: 100px auto;
-            padding: 20px;
-            line-height: 1.6;
-        }
-        h1 { color: #6d4aff; }
-        a { color: #6d4aff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .footer { margin-top: 50px; border-top: 1px solid #ddd; padding-top: 20px; }
-    </style>
-</head>
-<body>
-    <h1>Bienvenue sur mon serveur</h1>
-    <p>Ceci est votre page d'accueil statique.</p>
-    <p>Pour accéder au moteur de recherche privé, rendez-vous sur : <strong><a href="${SEARX_PREFIX}/">${SEARX_PREFIX}</a></strong></p>
-    <div class="footer">
-        <p><small>Hébergé sur Raspberry Pi • SearXNG • Nginx</small></p>
-    </div>
-</body>
-</html>
-EOF
-
-    cat > "$STATIC_ROOT/about.html" << EOF
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <title>À propos</title>
-    <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 100px auto; padding: 20px; }
-        h1 { color: #6d4aff; }
-        a { color: #6d4aff; text-decoration: none; }
-    </style>
-</head>
-<body>
-    <h1>À propos</h1>
-    <p>Ce serveur héberge :</p>
-    <ul>
-        <li>Un moteur de recherche privé SearXNG (<a href="${SEARX_PREFIX}/">accès</a>)</li>
-        <li>Dans un environnement sécurisé (HTTPS, rate limiting)</li>
-    </ul>
-    <p><a href="/">Retour à l'accueil</a></p>
-</body>
-</html>
-EOF
-
-    # Permissions
-    chown -R www-data:www-data "$STATIC_ROOT"
-    chmod -R 755 "$STATIC_ROOT"
-
-    log_info "Pages statiques créées dans $STATIC_ROOT"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 6 : Configuration SearXNG (Docker Compose)
-# -----------------------------------------------------------------------------
-setup_searxng() {
-    log_step "Configuration de SearXNG (sous-dossier ${SEARX_PREFIX})"
-
-    mkdir -p "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-
-    # --- docker-compose.yml ---
-    cat > docker-compose.yml << 'EOF'
-version: "3.7"
+# ── 9. Docker Compose ────────────────────────────────────
+cat <<'EOF' > docker-compose.yml
+version: "3.8"
 
 services:
   searxng:
@@ -542,494 +141,335 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./settings.yml:/etc/searxng/settings.yml:ro
+      - ./searxng:/etc/searxng:rw
     environment:
-      - TZ=Europe/Paris
+      - SEARXNG_BASE_URL=${SEARXNG_BASE_URL}
+      - SEARXNG_SECRET=${SEARXNG_SECRET_KEY}
     cap_drop:
       - ALL
     cap_add:
       - CHOWN
       - SETGID
       - SETUID
-    mem_limit: 256m
+    mem_limit: 512m
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
 
-networks:
-  default:
-    driver: bridge
+  ddns-updater:
+    image: ghcr.io/nicocraft86/ddns-updater:latest
+    container_name: ddns-updater
+    restart: unless-stopped
+    environment:
+      - PERIOD=5m
+      - LOG_LEVEL=info
+      - PROVIDER=${DDNS_PROVIDER}
+      - DOMAIN=${DDNS_DOMAIN}
+      - TOKEN=${DDNS_TOKEN}
+      - UPDATE_URL=${DDNS_UPDATE_URL}
+    volumes:
+      - ./ddns-data:/updater/data
 EOF
 
-    # --- settings.yml ---
-    local SECRET_KEY
-    SECRET_KEY="$(openssl rand -hex 32)"
+# ── 10. Initialisation de la config SearXNG ───────────────
+echo -e "${YELLOW}[6/8] Initialisation de SearXNG...${NC}"
+mkdir -p searxng ddns-data
 
-    cat > settings.yml << EOF
-use_default_settings: true
+# Génère le settings.yml par défaut
+docker compose run --rm --entrypoint "" searxng sh -c \
+    "if [ ! -f /etc/searxng/settings.yml ]; then searxng-doc gen-settings /etc/searxng/settings.yml; fi" 2>/dev/null || true
 
-general:
-  debug: false
-  instance_name: "${SEARX_INSTANCE_NAME}"
-  contact_url: false
-
-server:
-  secret_key: "${SECRET_KEY}"
-  limiter: false
-  image_proxy: true
-  base_url: "https://${DOMAIN}${SEARX_PREFIX}/"
-  url_prefix: "${SEARX_PREFIX}"
-
-ui:
-  default_locale: "${SEARX_LANG}"
-  default_theme: simple
-  infinite_scroll: true
-  center_alignment: true
-
-search:
-  safe_search: 0
-  autocomplete: "google"
-  formats:
-    - html
-    - json
-
-redis:
-  url: false
-
-engines:
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
-  - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
-    disabled: false
-  - name: brave
-    engine: brave
-    shortcut: br
-    disabled: false
-  - name: qwant
-    engine: qwant
-    shortcut: qw
-    disabled: false
-EOF
-
-    # --- .env ---
-    cat > .env << EOF
-SEARXNG_SECRET=${SECRET_KEY}
-SEARXNG_HOST=127.0.0.1
-SEARXNG_PORT=${SEARX_PORT}
-SEARX_PREFIX=${SEARX_PREFIX}
-TZ=Europe/Paris
-EOF
-
-    chown -R 1000:1000 "$INSTALL_DIR" || true
-
-    log_info "SearXNG configuré dans $INSTALL_DIR"
-    log_info "SearXNG sera accessible via : https://${DOMAIN}${SEARX_PREFIX}/"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 7 : Démarrage de SearXNG
-# -----------------------------------------------------------------------------
-start_searxng() {
-    log_step "Démarrage de SearXNG"
-
-    cd "$INSTALL_DIR"
-    docker compose pull
-    docker compose up -d
-
+# Si toujours absent, on lance une fois le conteneur pour qu'il génère le fichier
+if [ ! -f searxng/settings.yml ]; then
+    docker compose up -d searxng
     sleep 5
+    docker compose stop searxng
+fi
 
-    if docker compose ps | grep -q "Up"; then
-        log_info "SearXNG est en cours d'exécution"
-    else
-        log_warn "SearXNG ne semble pas démarré. Vérifiez : docker compose logs"
+# On s'assure que la limite est levée pour l'accès à distance
+if [ -f searxng/settings.yml ]; then
+    sed -i 's/limiter: false/limiter: true/' searxng/settings.yml 2>/dev/null || true
+    # Désactive le blocage par IP en mode production (à ajuster selon vos besoins)
+    sed -i 's|base_url:.*|base_url: "https://'"${DDNS_DOMAIN}"'/"|' searxng/settings.yml 2>/dev/null || true
+fi
+
+# ── 11. Démarrage de SearXNG ─────────────────────────────
+echo -e "${YELLOW}[7/8] Démarrage des conteneurs...${NC}"
+docker compose up -d
+
+# Attendre que SearXNG réponde
+echo -e "${YELLOW}Attente du démarrage de SearXNG...${NC}"
+for i in $(seq 1 30); do
+    if curl -sf "http://127.0.0.1:${SEARX_PORT}/" >/dev/null 2>&1; then
+        echo -e "${GREEN}SearXNG répond !${NC}"
+        break
     fi
-}
+    sleep 2
+    if [ "$i" -eq 30 ]; then
+        echo -e "${RED}SearXNG ne répond pas sur le port ${SEARX_PORT}.${NC}"
+        echo "Vérifiez les logs : docker compose logs searxng"
+    fi
+done
 
-# -----------------------------------------------------------------------------
-# Étape 8 : Configuration Nginx (HTTP d'abord, pour Let's Encrypt)
-# -----------------------------------------------------------------------------
-configure_nginx_http() {
-    log_step "Configuration Nginx (HTTP temporaire pour Let's Encrypt)"
+# ── 12. Configuration Nginx (Reverse Proxy) ──────────────
+echo -e "${YELLOW}[8/8] Configuration du reverse proxy Nginx...${NC}"
 
-    cat > "$NGINX_CONF" << EOF
+NGINX_CONF="/etc/nginx/sites-available/searxng"
+
+cat <<EOF > "$NGINX_CONF"
+# ── Reverse proxy Nginx pour SearXNG ─────────────────────
+# Généré par install_searx_rpi.sh
+
+# Redirection HTTP -> HTTPS
 server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
+    listen ${HTTP_PORT};
+    listen [::]:${HTTP_PORT};
+    server_name ${DDNS_DOMAIN};
 
+    # Let's Encrypt challenge
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
 
-    location ${SEARX_PREFIX}/ {
-        return 301 https://\$host${SEARX_PREFIX}/;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-EOF
-
-    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/searxng
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-
-    mkdir -p /var/www/html
-
-    nginx -t 2>/dev/null && systemctl restart nginx
-    log_info "Nginx configuré en HTTP (temporaire)"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 9 : Installation des certificats Let's Encrypt
-# -----------------------------------------------------------------------------
-install_certificates() {
-    log_step "Installation des certificats Let's Encrypt"
-
-    # Installation de Certbot
-    apt-get install -y -qq certbot python3-certbot-nginx >/dev/null 2>&1
-
-    # Petite pause pour que le DNS se propage
-    log_info "Vérification de la résolution DNS..."
-    local RESOLVED_IP
-    RESOLVED_IP=$(dig +short "$DOMAIN" 2>/dev/null || host "$DOMAIN" 2>/dev/null | grep "has address" | awk '{print $NF}')
-
-    if [[ -z "$RESOLVED_IP" ]]; then
-        log_warn "Le domaine $DOMAIN ne résout pas encore. En attente (60s)..."
-        sleep 60
-        RESOLVED_IP=$(dig +short "$DOMAIN" 2>/dev/null || echo "")
-    fi
-
-    local PUBLIC_IP
-    PUBLIC_IP=$(curl -s https://api.ipify.org 2>/dev/null || echo "")
-
-    if [[ -n "$RESOLVED_IP" && -n "$PUBLIC_IP" && "$RESOLVED_IP" != "$PUBLIC_IP" ]]; then
-        log_warn "Attention : $DOMAIN résout vers $RESOLVED_IP mais l'IP publique est $PUBLIC_IP"
-        log_warn "Le certificat Let's Encrypt pourrait échouer. Le script continue..."
-    fi
-
-    # Demande du certificat
-    certbot certonly \
-        --webroot \
-        --webroot-path=/var/www/html \
-        --email "${LE_EMAIL}" \
-        --agree-tos \
-        --no-eff-email \
-        -d "${DOMAIN}" \
-        --non-interactive
-
-    if [[ $? -eq 0 ]]; then
-        log_info "Certificat Let's Encrypt obtenu pour ${DOMAIN}"
-    else
-        log_error "Échec de l'obtention du certificat. Vérifiez le DNS et relancez."
-    fi
-
-    # Renouvellement automatique (cron)
-    systemctl enable certbot.timer 2>/dev/null || true
-    systemctl start certbot.timer 2>/dev/null || true
-
-    log_info "Renouvellement automatique activé"
-}
-
-# -----------------------------------------------------------------------------
-# Étape 10 : Configuration Nginx finale (HTTPS + proxy + pages statiques)
-# -----------------------------------------------------------------------------
-configure_nginx_https() {
-    log_step "Configuration Nginx finale (HTTPS + proxy + pages statiques)"
-
-    cat > "$NGINX_CONF" << EOF
-# Rate limiting zones
-limit_req_zone \$binary_remote_addr zone=searx_search:10m rate=5r/s;
-limit_req_zone \$binary_remote_addr zone=searx_static:10m rate=20r/s;
-limit_req_zone \$binary_remote_addr zone=searx_login:10m rate=1r/s;
-limit_req_zone \$binary_remote_addr zone=searx_api:10m rate=2r/s;
-limit_conn_zone \$binary_remote_addr zone=searx_conn:10m;
-
-limit_req_status 429;
-
-# Redirection HTTP → HTTPS
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
-    location ${SEARX_PREFIX}/ {
-        return 301 https://\$host${SEARX_PREFIX}/;
-    }
-
+    # Redirection vers HTTPS
     location / {
         return 301 https://\$host\$request_uri;
     }
 }
 
-# Serveur HTTPS principal
+# Serveur HTTPS
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${DOMAIN};
+    listen ${HTTPS_PORT} ssl http2;
+    listen [::]:${HTTPS_PORT} ssl http2;
+    server_name ${DDNS_DOMAIN};
 
-    # Certificats Let's Encrypt
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    # Certificats SSL (gérés par certbot)
+    ssl_certificate     /etc/letsencrypt/live/${DDNS_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DDNS_DOMAIN}/privkey.pem;
 
-    # Paramètres SSL
+    # Paramètres SSL modernes
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers on;
     ssl_session_cache shared:SSL:10m;
     ssl_session_timeout 1d;
 
-    # En-têtes de sécurité (globaux)
+    # Headers de sécurité
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "no-referrer" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer always;
 
-    # ===========================================
-    # Pages statiques à la racine (/)
-    # ===========================================
+    # Reverse proxy vers SearXNG
     location / {
-        root ${STATIC_ROOT};
-        index index.html index.htm;
-        
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # ===========================================
-    # SearXNG sous ${SEARX_PREFIX}/
-    # ===========================================
-
-    # Recherche principale
-    location ${SEARX_PREFIX}/search {
-        limit_req zone=searx_search burst=10 nodelay;
-        limit_conn zone=searx_conn 20;
-
         proxy_pass http://127.0.0.1:${SEARX_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+        proxy_set_header Connection \$http_connection;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_redirect off;
     }
 
-    # Pages statiques de SearXNG (CSS, JS, images)
-    location ${SEARX_PREFIX}/static/ {
-        limit_req zone=searx_static burst=50 nodelay;
-
+    # Cache des fichiers statiques
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
         proxy_pass http://127.0.0.1:${SEARX_PORT};
-        proxy_set_header Host \$host;
-
-        expires 30d;
+        proxy_cache_valid 200 1d;
+        expires 1d;
         add_header Cache-Control "public, immutable";
     }
+}
+EOF
 
-    # Interface admin / stats (BLOQUÉE - 404)
-    location ~ ^${SEARX_PREFIX}/(config|stats)/ {
-        deny all;
-        return 404;
+# Activer le site Nginx
+ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/searxng
+
+# Désactiver le site par défaut
+rm -f /etc/nginx/sites-enabled/default
+
+# Tester la configuration Nginx
+echo -e "${YELLOW}Test de la configuration Nginx...${NC}"
+if nginx -t; then
+    systemctl reload nginx
+    echo -e "${GREEN}Configuration Nginx validée.${NC}"
+else
+    echo -e "${RED}Erreur de configuration Nginx !${NC}"
+    echo "Le certificat SSL n'existe probablement pas encore."
+    echo "Lancement de certbot pour générer le certificat..."
+fi
+
+# ── 13. Génération du certificat Let's Encrypt ────────────
+echo -e "${YELLOW}Génération du certificat Let's Encrypt...${NC}"
+
+# Préparation du dossier pour le challenge ACME
+mkdir -p /var/www/html/.well-known/acme-challenge
+
+# Configuration Nginx temporaire (HTTP uniquement) pour le challenge
+# si les certificats n'existent pas encore
+LE_CERT_PATH="/etc/letsencrypt/live/${DDNS_DOMAIN}/fullchain.pem"
+
+if [ ! -f "$LE_CERT_PATH" ]; then
+    echo -e "${YELLOW}Certificat absent. Préparation d'une config HTTP temporaire...${NC}"
+
+    # Config temporaire HTTP uniquement pour passer le challenge
+    cat <<EOF > /etc/nginx/sites-enabled/searxng
+server {
+    listen ${HTTP_PORT};
+    listen [::]:${HTTP_PORT};
+    server_name ${DDNS_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
     }
 
-    # Route principale ${SEARX_PREFIX}/ (formulaire de recherche)
-    location ${SEARX_PREFIX}/ {
-        limit_req zone=searx_search burst=10 nodelay;
-        limit_conn zone=searx_conn 20;
-
+    location / {
         proxy_pass http://127.0.0.1:${SEARX_PORT};
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
 
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    systemctl reload nginx
+
+    # Génération du certificat
+    certbot certonly --webroot \
+        -w /var/www/html \
+        -d "$DDNS_DOMAIN" \
+        --non-interactive \
+        --agree-tos \
+        --email "admin@${DDNS_DOMAIN}" \
+        --no-eff-email
+
+    # Réécriture de la configuration Nginx complète (HTTP + HTTPS)
+    cat <<EOF > "$NGINX_CONF"
+# ── Reverse proxy Nginx pour SearXNG ─────────────────────
+# Régénéré après obtention du certificat Let's Encrypt
+
+server {
+    listen ${HTTP_PORT};
+    listen [::]:${HTTP_PORT};
+    server_name ${DDNS_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
     }
 
-    # API SearXNG
-    location ${SEARX_PREFIX}/api/ {
-        limit_req zone=searx_api burst=5 nodelay;
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
 
+server {
+    listen ${HTTPS_PORT} ssl http2;
+    listen [::]:${HTTPS_PORT} ssl http2;
+    server_name ${DDNS_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DDNS_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DDNS_DOMAIN}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy no-referrer always;
+
+    location / {
         proxy_pass http://127.0.0.1:${SEARX_PORT};
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Connection \$http_connection;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_redirect off;
+    }
 
-        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)\$ {
+        proxy_pass http://127.0.0.1:${SEARX_PORT};
+        proxy_cache_valid 200 1d;
+        expires 1d;
+        add_header Cache-Control "public, immutable";
     }
 }
 EOF
 
-    # Hook de renouvellement : reload nginx après obtention du nouveau certif
-    local HOOK_DIR="/etc/letsencrypt/renewal-hooks/deploy"
-    mkdir -p "$HOOK_DIR"
-    cat > "$HOOK_DIR/reload-nginx.sh" << 'EOF'
+    ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/searxng
+    systemctl reload nginx
+    echo -e "${GREEN}Certificat Let's Encrypt généré et Nginx reconfiguré.${NC}"
+else
+    echo -e "${GREEN}Certificat Let's Encrypt déjà présent.${NC}"
+fi
+
+# ── 14. Renouvellement automatique ───────────────────────
+echo -e "${YELLOW}Configuration du renouvellement automatique...${NC}"
+
+# Test du renouvellement
+certbot renew --dry-run 2>/dev/null && echo -e "${GREEN}Renouvellement test OK.${NC}" || \
+    echo -e "${YELLOW}Le test de renouvellement a échoué (peut être normal en première utilisation).${NC}"
+
+# Cron de renouvellement (certbot crée normalement son propre timer systemd)
+systemctl enable certbot.timer 2>/dev/null || true
+systemctl start certbot.timer 2>/dev/null || true
+
+# Hook de rechargement Nginx après renouvellement
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat <<'EOF' > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 #!/bin/bash
-/usr/bin/systemctl reload nginx
+/usr/sbin/nginx -s reload
 EOF
-    chmod +x "$HOOK_DIR/reload-nginx.sh"
+chmod +x /etc/letsencrypt/renewal-hooks/deload-nginx.sh 2>/dev/null || \
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
-    nginx -t 2>/dev/null && systemctl restart nginx
+# ── 15. Pare-feu UFW ────────────────────────────────────
+echo -e "${YELLOW}Configuration du pare-feu (UFW)...${NC}"
+ufw allow OpenSSH
+ufw allow "${HTTP_PORT}/tcp"
+ufw allow "${HTTPS_PORT}/tcp"
+ufw --force enable
+echo -e "${GREEN}Pare-feu configuré.${NC}"
 
-    log_info "Nginx configuré en HTTPS avec proxy inverse"
-}
+# ── 16. Résumé final ─────────────────────────────────────
+LOCAL_IP=$(hostname -I | awk '{print $1}')
 
-# -----------------------------------------------------------------------------
-# Étape 11 : Vérification finale
-# -----------------------------------------------------------------------------
-final_checks() {
-    log_step "Vérifications finales"
-
-    local OK=0
-    local FAIL=0
-
-    check_service() {
-        if systemctl is-active --quiet "$1" 2>/dev/null; then
-            echo -e "  ${C_GREEN}✓${C_RESET} $1 : actif"
-            OK=$((OK + 1))
-        else
-            echo -e "  ${C_RED}✗${C_RESET} $1 : inactif"
-            FAIL=$((FAIL + 1))
-        fi
-    }
-
-    check_service "docker"
-    check_service "nginx"
-
-    if docker compose -f "$INSTALL_DIR/docker-compose.yml" ps 2>/dev/null | grep -q "Up"; then
-        echo -e "  ${C_GREEN}✓${C_RESET} SearXNG : en cours d'exécution"
-        OK=$((OK + 1))
-    else
-        echo -e "  ${C_RED}✗${C_RESET} SearXNG : arrêté"
-        FAIL=$((FAIL + 1))
-    fi
-
-    if [[ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
-        echo -e "  ${C_GREEN}✓${C_RESET} Certificat Let's Encrypt : présent"
-        OK=$((OK + 1))
-    else
-        echo -e "  ${C_RED}✗${C_RESET} Certificat Let's Encrypt : absent"
-        FAIL=$((FAIL + 1))
-    fi
-
-    if crontab -l 2>/dev/null | grep -q "dns-update"; then
-        echo -e "  ${C_GREEN}✓${C_RESET} DNS dynamique (${DNS_PROVIDER}) : cron actif"
-        OK=$((OK + 1))
-    else
-        echo -e "  ${C_RED}✗${C_RESET} DNS dynamique : cron manquant"
-        FAIL=$((FAIL + 1))
-    fi
-
-    echo ""
-    echo -e "  Résultat : ${C_GREEN}$OK OK${C_RESET} / ${C_RED}$FAIL échec(s)${C_RESET}"
-}
-
-# -----------------------------------------------------------------------------
-# Résumé final
-# -----------------------------------------------------------------------------
-show_summary() {
-    local LOCAL_IP
-    LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-
-    cat << EOF
-
-${C_GREEN}╔══════════════════════════════════════════════════════╗
-║         INSTALLATION TERMINÉE AVEC SUCCÈS            ║
-╚══════════════════════════════════════════════════════╝${C_RESET}
-
-${C_BOLD}Accès :${C_RESET}
-  • Page d'accueil   : https://${DOMAIN}/
-  • SearXNG          : https://${DOMAIN}${SEARX_PREFIX}/
-  • SearXNG (local)  : http://${LOCAL_IP}:${SEARX_PORT}
-
-${C_BOLD}Services installés :${C_RESET}
-  • Docker           $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')
-  • Nginx            $(nginx -v 2>&1 | awk -F/ '{print $2}')
-  • SearXNG          $(docker compose -f "$INSTALL_DIR/docker-compose.yml" images 2>/dev/null | grep searxng | awk '{print $2}')
-  • Certbot          $(certbot --version 2>/dev/null | awk '{print $2}')
-  • DNS dynamique    ${DNS_PROVIDER} (toutes les ${DNS_UPDATE_INTERVAL} min)
-
-${C_BOLD}Fichiers importants :${C_RESET}
-  • Config générale   : ${CONF_FILE}
-  • Docker Compose    : ${INSTALL_DIR}/docker-compose.yml
-  • SearXNG settings  : ${INSTALL_DIR}/settings.yml
-  • Nginx             : ${NGINX_CONF}
-  • Certificats SSL   : /etc/letsencrypt/live/${DOMAIN}/
-  • Log DNS           : /var/log/dns-update.log
-  • Pages statiques   : ${STATIC_ROOT}/
-
-${C_BOLD}Commandes utiles :${C_RESET}
-  • Logs SearXNG     : cd ${INSTALL_DIR} && docker compose logs -f
-  • Redémarrer       : cd ${INSTALL_DIR} && docker compose restart
-  • Logs Nginx       : journalctl -u nginx -f
-  • Tester SSL       : curl -I https://${DOMAIN}/
-  • Renouveler certif: sudo certbot renew --dry-run
-  • Logs DNS         : tail -f /var/log/dns-update.log
-
-${C_YELLOW}${C_BOLD}Pensez à ouvrir les ports 80 et 443 sur votre routeur/box${C_RESET}
-${C_YELLOW}vers l'IP locale du Raspberry Pi : ${LOCAL_IP}${C_RESET}
-
-${C_BOLD}Architecture :${C_RESET}
-  ┌─────────────┐      ┌──────────────────┐      ┌─────────────┐
-  │ Internet    │──────│ Nginx (443/HTTPS)│──────│ SearXNG     │
-  │             │      │ + pages statiques│      │ (:8080 local)│
-  └─────────────┘      └──────────────────┘      └─────────────┘
-
-  /            → pages statiques (${STATIC_ROOT}/)
-  ${SEARX_PREFIX}/         → SearXNG (proxy inverse)
-
-${C_BOLD}DNS dynamique (${DNS_PROVIDER}):${C_RESET}
-  - Domain  : ${DOMAIN}
-  - Update  : /usr/local/bin/*dns-update.sh (cron */${DNS_UPDATE_INTERVAL})
-  - Log     : /var/log/dns-update.log
-
-EOF
-}
-
-# =============================================================================
-# Point d'entrée
-# =============================================================================
-main() {
-    echo -e "${C_CYAN}${C_BOLD}"
-    echo "╔══════════════════════════════════════════════╗"
-    echo "║  Installation Docker + SearXNG + Nginx (RPi) ║"
-    echo "║  avec DNS dynamique + Let's Encrypt          ║"
-    echo "╚══════════════════════════════════════════════╝"
-    echo -e "${C_RESET}"
-
-    check_root
-    check_raspberry_pi
-
-    # Génère ou charge la configuration AVANT toute chose (avec choix DNS)
-    generate_config_file
-
-    # Étapes d'installation
-    system_update
-    install_docker
-    install_nginx
-    setup_static_pages
-    setup_dns_dynamic
-    setup_searxng
-    start_searxng
-    configure_nginx_http
-    install_certificates
-    configure_nginx_https
-    final_checks
-    show_summary
-}
-
-main "$@"
+echo ""
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}  Installation terminée avec succès !${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
+echo ""
+echo -e "${CYAN}── Accès ──────────────────────────────────────────${NC}"
+echo -e "  Local :  http://${LOCAL_IP}:${SEARX_PORT}"
+echo -e "  Web  :  https://${DDNS_DOMAIN}"
+echo ""
+echo -e "${CYAN}── Configuration DNS ──────────────────────────────${NC}"
+echo -e "  Service : ${SERVICE_TYPE}"
+echo -e "  Domaine : ${DDNS_DOMAIN}"
+echo ""
+echo -e "${CYAN}── Sécurité ──────────────────────────────────────${NC}"
+echo -e "  HTTPS    : Actif (Let's Encrypt)"
+echo -e "  Firewall : UFW activé (SSH + HTTP + HTTPS)"
+echo -e "  SSL auto-renew : Configuré"
+echo ""
+echo -e "${CYAN}── Commandes utiles ──────────────────────────────${NC}"
+echo -e "  Logs SearXNG   : docker compose -f ${PROJECT_DIR}/docker-compose.yml logs -f searxng"
+echo -e "  Redémarrer    : docker compose -f ${PROJECT_DIR}/docker-compose.yml restart"
+echo -e "  Config SearX  : ${PROJECT_DIR}/searxng/settings.yml"
+echo -e "  Config Nginx  : ${NGINX_CONF}"
+echo -e "  Renouvel SSL  : certbot renew"
+echo ""
+echo -e "${YELLOW}La configuration des moteurs de recherche se fait"
+echo -e "  dans l'interface d'administration de SearXNG.${NC}"
+echo ""
