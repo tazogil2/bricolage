@@ -56,6 +56,8 @@ Autres champs optionnels :
 
 Relancer le script après l'édition de la configuration : 
 
+    sudo ./auto-host-searx.sh
+
 Ouvertures réseau :
 
 |---Port---|---Destination---|
