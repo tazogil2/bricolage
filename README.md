@@ -55,12 +55,15 @@ Ouvertures réseau :
 |80	| Routeur → IP RPi |
 | 443	| Routeur → IP RPi |
 
-Points d'attention :
+Les étapes de ce script :
 
-|Élément | Vérification |
-|---|---|
-|url_prefix	| Vérifié dans settings.yml |
-|proxy_pass	| Pas de ${SEARX_PREFIX} inclus |
-|Routes bloquées |	/config et /stats renvoie 404 |
-|Statiques	| / sert depuis ${STATIC_ROOT} |
-|SearXNG	| ${SEARX_PREFIX}/ sert via proxy |
+|Étape |	Commentaire|
+|------|------|
+|Nginx| 	Installation et configuration complète du reverse proxy| 
+|HTTPS	| Génération automatique du certificat Let's Encrypt via certbot| 
+|Stratégie SSL| 	Config temporaire HTTP-only pour le challenge ACME, puis reconfiguration HTTPS complète| 
+|Renouvellement| 	Timer systemd + hook de rechargement Nginx après renouvellement| 
+|Pare-feu| 	UFW activé (SSH + 80 + 443 uniquement)| 
+|Sécurité| 	Headers HSTS, X-Frame-Options, X-Content-Type-Options, Referrer-Policy| 
+|Cache	| Mise en cache des fichiers statiques via Nginx| 
+| Port binding	| SearXNG bindé sur 127.0.0.1:8080 uniquement (non exposé publiquement)| 
