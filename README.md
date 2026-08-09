@@ -1,13 +1,14 @@
+# Auto-heberger Searx et LinkDing sur un Raspberry
 
-!!!danger "Point Critique : Votre adresse IP et le CGNAT"
- 
-    Avant toute installation, vérifiez si votre FAI vous attribue une vraie adresse IP publique ou s'il utilise le CGNAT (Carrier-Grade NAT).
+## ⚠️ Avant toute installation
 
-    Test rapide : Allez sur [whatismyip.com](https://whatismyip.com) depuis votre ordinateur connecté au même réseau. Comparez cette IP avec celle affichée dans l'interface de votre box internet.
+Vérifiez si votre FAI vous attribue une vraie adresse IP publique ou s'il utilise le CGNAT (Carrier-Grade NAT).
 
-    Si elles sont identiques : Vous avez une IP publique. Vous pourrez utiliser le Port Forwarding (méthode standard).
+Test rapide : Allez sur [whatismyip.com](https://whatismyip.com) depuis votre ordinateur connecté au même réseau. Comparez cette IP avec celle affichée dans l'interface de votre box internet.
 
-    Si elles sont différentes (ou commençant par 100.x.x.x) : Vous êtes derrière le CGNAT. Le port forwarding classique ne fonctionnera pas, votre FAI interdit cette solution d'Auto-hébergement.
+Si elles sont identiques : Vous avez une IP publique. Vous pourrez utiliser le Port Forwarding (méthode standard).
+
+Si elles sont différentes (ou commençant par 100.x.x.x) : Vous êtes derrière le CGNAT. Le port forwarding classique ne fonctionnera pas, votre FAI interdit cette solution d'Auto-hébergement.
 
 Ce guide permet d'installer un serveur personnel abritant Searx (moteur de recherche privé), Linkding (gestionnaire de signets) et un espace pour des pages statiques (blog). Tout est automatisé via un script bash pour les utilisateurs débutants.
 
