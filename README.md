@@ -86,9 +86,13 @@ Redirection de Ports (Port Forwarding) : Créez des règles pour rediriger le tr
 
 ## 💻 4. Déploiement du Script
 
-Ouvrez un terminal sur votre ordinateur principal et exécutez les commandes suivantes. Remplacez <UTIL> par votre nom d'utilisateur et <IP> par l'IP locale du Pi.
+1. Téléchargez l'archive zip contenant le script ici : [github.com/tazogil2/bricolage](https://github.com/tazogil2/bricolage). Décompactez l'archive, ouvrez le dossier "bricolage-main" et copiez son chemin d'accès.
 
-1. Transférer le script:
+2. Ouvrez un terminal sur votre ordinateur principal et exécutez les commandes suivantes :
+
+        cd <LE CHEMIN QUE VOUS VENEZ DE COPIER>
+
+1. Transférer le script, remplacez <UTIL> par votre nom d'utilisateur et <IP> par l'IP locale du Pi.
 
         scp installer-rpi.sh <UTIL>@<IP>:~
 
@@ -117,7 +121,7 @@ Une fois le script terminé :
 |  -----|  -----|  
 | Recherche|  https://searx.<votre-domaine>.duckdns.org| 
 |  Signets|  https://ld.<votre-domaine>.duckdns.org| 
-|  Blog|  https://blog.<votre-domaine>.duckdns.org| 
+|  Blog|  https://<votre-domaine>.duckdns.org| 
 |  Connexion SSH | ssh <UTIL>@<votre-domaine>.duckdns.org| 
 
 ## 🔒 6. Sécurité et Maintenance
