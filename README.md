@@ -80,6 +80,8 @@ Redirection de Ports (Port Forwarding) : Créez des règles pour rediriger le tr
 
 ## 💻 4. Déploiement du Script
 
+⚠️   Connectez-vous au Raspberry avec le même ordinateur qui a servi à flasher la carte SD car le flashage a copié sur le Raspberry seulement la clé publique créée sur cet ordinateur.
+
 1. Téléchargez l'archive zip contenant le script ici : [github.com/tazogil2/bricolage](https://github.com/tazogil2/bricolage). Appuyez sur le bouton vert *code* pour accéder à l'archive. Décompactez l'archive, ouvrez le dossier "bricolage-main" et copiez son chemin d'accès.
 
 2. Ouvrez un terminal sur votre ordinateur principal et exécutez les commandes suivantes :
@@ -129,8 +131,6 @@ Pour changer la phrsa de passe :
     ssh-keygen -p -f ~/.ssh/id_ed25519
 
 Pour gérer la saisie automatique : Configurez ssh-agent (voir annexe).
-
-
 
 ## 🆘 Annexe : Dépannage
 | Problème| Solution|
