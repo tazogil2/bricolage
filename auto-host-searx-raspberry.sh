@@ -401,7 +401,6 @@ print_info "Génération des certificats SSL..."
 certbot certonly --webroot \
   -w /var/www/html \
   -d "${DUCKDNS_DOMAIN}" \
-  -d "*.${DUCKDNS_DOMAIN}" \
   --non-interactive \
   --agree-tos \
   --email "${SSL_EMAIL}" \
