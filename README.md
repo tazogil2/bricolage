@@ -1,4 +1,4 @@
-# Auto-heberger Searx et LinkDing sur un Raspberry
+# Auto-heberger Searx sur un Raspberry
 
 ## ⚠️ Avant toute installation
 
@@ -42,12 +42,6 @@ Inscrivez-vous sur [DuckDNS.org](https://duckdns.org) (connexion possible avec G
 
 1. Créez un domaine (ex: mon-projet.duckdns.org).
 2. Notez le token affiché sur la page — il sera demandé plus tard.
-3. Créez les sous-domaines suivants dans votre tableau de bord DuckDNS :
-
-      *    searx.mon-projet (Recherche → searx.mon-projet.duckdns.org)
-      *    ld.mon-projet (Signets → ld.mon-projet.duckdns.org)
-      *    blog.mon-projet (Blog → blog.mon-projet.duckdns.org)
-
 
 ### C. Installation de l'OS sur la Carte SD
 
@@ -94,7 +88,7 @@ Redirection de Ports (Port Forwarding) : Créez des règles pour rediriger le tr
 
 1. Transférer le script, remplacez <UTIL> par votre nom d'utilisateur et <IP> par l'IP locale du Pi.
 
-        scp installer-rpi.sh <UTIL>@<IP>:~
+        scp auto-host-searx-raspberry.sh <UTIL>@<IP>:~
 
 2. Se connecter au Pi
 
@@ -102,15 +96,14 @@ Redirection de Ports (Port Forwarding) : Créez des règles pour rediriger le tr
 
 3. Rendre le script exécutable et lancer l'installation
 
-        chmod 700 installer-rpi.sh
-        ./installer-rpi.sh
+        chmod 700 auto-host-searx-raspberry.sh
+        ./auto-host-searx-raspberry.sh
 
 Suivez les instructions à l'écran. Le script va :
 
 1. Vérifier et monter la clé USB sur /var/www.
 2. Installer Docker, Nginx, Fail2Ban et UFW.
 3. Demander votre token DuckDNS et configurer les certificats SSL.
-4. Déployer Searx, Linkding et la page "Work in Progress".
 5. Sécuriser l'accès SSH et activer le pare-feu.
 
 ## ✅ 5. Vérifications Finales
@@ -119,8 +112,7 @@ Une fois le script terminé :
 
 |  Service | URL |
 |  -----|  -----|  
-| Recherche|  https://searx.<votre-domaine>.duckdns.org| 
-|  Signets|  https://ld.<votre-domaine>.duckdns.org| 
+| Recherche|  https://<votre-domaine>.duckdns.org/searx| 
 |  Blog|  https://<votre-domaine>.duckdns.org| 
 |  Connexion SSH | ssh <UTIL>@<votre-domaine>.duckdns.org| 
 
