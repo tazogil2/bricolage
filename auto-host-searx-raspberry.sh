@@ -1,14 +1,15 @@
 #!/bin/bash
 
-# installer-rpi.sh - VERSION MINIMALE
-# Installation de SearXNG seule avec page statique
-#   - DuckDNS uniquement (1 domaine)
+# auto-host-searx-raspberry.sh
+# Installation de SearXNG + Page statique sur Raspberry Pi
+#   - DuckDNS uniquement (1 domaine, pas de sous-domaine)
 #   - Searx sur /searx/
-#   - Linkding en local uniquement (localhost:9090)
 #   - Page statique à la racine
+#   - Formatage automatique de la clé USB en ext4
+#   - Sécurité: SSH par clé, UFW
 #
 # Auteur : tazogil2 assisté de Lumo / Projet bricolage
-# Date : 2026-08-09
+# Date : 2026-08-10
 
 set -e
 
@@ -55,43 +56,76 @@ print_banner
 REAL_USER="${SUDO_USER:-$USER}"
 print_info "Utilisateur détecté : ${REAL_USER}"
 
-# ── 2. Vérification de la clé USB ────────────────────────
+# ── 2. Détection et formatage automatique de la clé USB ──
 print_step "1/10" "Vérification du stockage USB..."
 
+USB_DEVICE=""
 USB_PARTITION=""
-MOUNTED_USB=$(mount | grep -E "/dev/sd[a-z][0-9]" | grep "ext4" | awk '{print $1}' | head -n1)
-if [ -n "$MOUNTED_USB" ]; then
-  USB_PARTITION="$MOUNTED_USB"
-else
-  for dev in /dev/sd[a-z][0-9]; do
-    if [ -b "$dev" ]; then
-      FS_TYPE=$(blkid -s TYPE -o value "$dev" 2>/dev/null)
-      if [ "$FS_TYPE" = "ext4" ]; then
-        USB_PARTITION="$dev"
-        break
-      fi
-    fi
-  done
-fi
 
-if [ -z "$USB_PARTITION" ]; then
-  print_error "Aucune clé USB formatée ext4 détectée."
-  print_warning "Veuillez brancher une clé USB formatée en ext4 et relancer le script."
-  print_warning "Formatage possible avec : sudo mkfs.ext4 /dev/sdX"
+# Détecter les disques USB (exclure mmcblk qui est la carte SD du Pi)
+for dev in /dev/sd[a-z]; do
+  if [ -b "$dev" ]; then
+    USB_DEVICE="$dev"
+    # Chercher la première partition
+    if [ -b "${dev}1" ]; then
+      USB_PARTITION="${dev}1"
+    else
+      USB_PARTITION="$dev"
+    fi
+    break
+  fi
+done
+
+if [ -z "$USB_DEVICE" ]; then
+  print_error "Aucune clé USB détectée."
+  print_warning "Veuillez brancher une clé USB et relancer le script."
   exit 1
 fi
 
-print_success "Clé USB détectée : ${USB_PARTITION}"
+print_warning "═══════════════════════════════════════════════════════"
+print_warning "⚠ ATTENTION :"
+print_warning "La clé USB détectée (${USB_DEVICE}) va être FORMATÉE en ext4."
+print_warning "TOUTES LES DONNÉES PRÉSENTES SUR CETTE CLÉ SERONT EFFACÉES !"
+print_warning "═══════════════════════════════════════════════════════"
+print_warning ""
+
+read -p "Confirmer le formatage de ${USB_DEVICE} ? (oui/non) : " CONFIRM_FORMAT
+
+if [ "$CONFIRM_FORMAT" != "oui" ]; then
+  print_error "Formatage annulé. Impossible de continuer sans clé USB."
+  exit 1
+fi
+
+# Démonter la clé si elle est montée
+umount "${USB_DEVICE}" 2>/dev/null || true
+umount "${USB_DEVICE}1" 2>/dev/null || true
+umount "${USB_DEVICE}"* 2>/dev/null || true
+
+# Effacer toutes les signatures existantes
+print_info "Effacement des données existantes..."
+wipefs -a "${USB_DEVICE}" 2>/dev/null || true
+
+# Créer une nouvelle table de partitions et une partition unique
+print_info "Création de la partition..."
+parted -s "${USB_DEVICE}" mklabel msdos
+parted -s "${USB_DEVICE}" mkpart primary ext4 0% 100%
+
+# Petite pause pour laisser le kernel détecter la nouvelle partition
+sleep 2
+
+USB_PARTITION="${USB_DEVICE}1"
+
+# Formater en ext4
+print_info "Formatage en ext4..."
+mkfs.ext4 -F "${USB_PARTITION}"
+
+print_success "Clé USB formatée : ${USB_PARTITION}"
 
 # ── 3. Montage USB persistant ────────────────────────────
 print_step "2/10" "Configuration du montage USB..."
 
 mkdir -p "$USB_MOUNT_POINT"
 mkdir -p "$WWW_ROOT"
-
-if mountpoint -q "$USB_MOUNT_POINT"; then
-  umount "$USB_MOUNT_POINT"
-fi
 
 mount "${USB_PARTITION}" "${USB_MOUNT_POINT}"
 print_success "Clé USB montée sur ${USB_MOUNT_POINT}"
@@ -124,7 +158,7 @@ print_success "Système mis à jour"
 
 # ── 5. Installation des dépendances ───────────────────────
 print_step "4/10" "Installation des dépendances..."
-apt install -y git curl openssl ufw nginx certbot python3-certbot-nginx
+apt install -y git curl openssl ufw nginx certbot python3-certbot-nginx parted
 print_success "Dépendances installées"
 
 # ── 6. Installation de Docker ────────────────────────────
@@ -190,8 +224,11 @@ print_step "8/10" "Configuration DuckDNS..."
 
 print_warning "═══════════════════════════════════════════════════════"
 print_warning "Sur https://www.duckdns.org, vous devez avoir créé :"
-print_warning "  Votre domaine principal (ex: mon-projet)"
+print_warning "  1. Votre domaine principal (ex: mon-projet)"
 print_warning "     → donne : mon-projet.duckdns.org"
+print_warning ""
+print_warning "C'est tout ! Un seul domaine suffit."
+print_warning "Searx sera accessible sur : https://mon-projet.duckdns.org/searx/"
 print_warning "═══════════════════════════════════════════════════════"
 echo ""
 
@@ -292,8 +329,8 @@ outgoing:
   pool_maxsize: 10
 EOF
 
-# ── 14. Configuration Nginx ──────────────────────────────
-print_info "Configuration Nginx..."
+# ── 14. Configuration Nginx (HTTP temporaire pour SSL) ───
+print_info "Configuration Nginx (HTTP temporaire)..."
 
 cat >/etc/nginx/nginx.conf <<'EOF'
 user www-data;
@@ -325,25 +362,104 @@ http {
 }
 EOF
 
-# 1. Décommentez ou modifiez la config Nginx pour HTTP seulement temporairement
-cat >/etc/nginx/sites-available/tazogil.duckdns.org <<'EOF'
+# Config HTTP temporaire (pour le challenge Let's Encrypt)
+cat >"/etc/nginx/sites-available/${DUCKDNS_DOMAIN}" <<EOF
 server {
-    listen 80;
-    listen [::]:80;
-    server_name tazogil.duckdns.org *.tazogil.duckdns.org;
+    listen ${HTTP_PORT};
+    listen [::]:${HTTP_PORT};
+    server_name ${DUCKDNS_DOMAIN};
 
     location /.well-known/acme-challenge/ {
         root /var/www/html;
         allow all;
     }
 
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+EOF
+
+ln -sf "/etc/nginx/sites-available/${DUCKDNS_DOMAIN}" "/etc/nginx/sites-enabled/"
+rm -f /etc/nginx/sites-enabled/default
+
+nginx -t && systemctl reload nginx
+print_success "Nginx configuré (HTTP temporaire)"
+
+# ── 15. Certificats SSL ──────────────────────────────────
+print_info "Génération des certificats SSL..."
+
+certbot certonly --webroot \
+  -w /var/www/html \
+  -d "${DUCKDNS_DOMAIN}" \
+  --non-interactive \
+  --agree-tos \
+  --email "${SSL_EMAIL}" \
+  --no-eff-email
+
+print_success "Certificats SSL générés"
+
+systemctl enable certbot.timer 2>/dev/null || true
+systemctl start certbot.timer 2>/dev/null || true
+
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat >/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+#!/bin/bash
+/usr/sbin/nginx -s reload
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+
+# ── 16. Configuration Nginx finale (HTTP + HTTPS) ─────────
+print_info "Configuration Nginx finale (HTTPS)..."
+
+cat >"/etc/nginx/sites-available/${DUCKDNS_DOMAIN}" <<EOF
+server {
+    listen ${HTTP_PORT};
+    listen [::]:${HTTP_PORT};
+    server_name ${DUCKDNS_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen ${HTTPS_PORT} ssl http2;
+    listen [::]:${HTTPS_PORT} ssl http2;
+    server_name ${DUCKDNS_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DUCKDNS_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DUCKDNS_DOMAIN}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    root /var/www/html;
+    index index.html;
+
+    # Page statique à la racine
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    # Searx sur /searx/
     location /searx/ {
         rewrite ^/searx/(.*)$ /$1 break;
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass http://127.0.0.1:${SEARX_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_buffering off;
@@ -357,115 +473,15 @@ server {
     location = /searx {
         return 301 /searx/;
     }
-
-    location / {
-        try_files $uri $uri/ =404;
-    }
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/tazogil.duckdns.org /etc/nginx/sites-enabled/
+ln -sf "/etc/nginx/sites-available/${DUCKDNS_DOMAIN}" "/etc/nginx/sites-enabled/"
+nginx -t && systemctl reload nginx
+print_success "Nginx configuré (HTTPS actif)"
 
-# 2. Testez et démarrez Nginx en HTTP
-sudo nginx -t && sudo systemctl restart nginx
-
-# 3. Générez le certificat maintenant
-certbot certonly --webroot \
-  -w /var/www/html \
-  -d "tazogil.duckdns.org" \
-  --non-interactive \
-  --agree-tos \
-  --email "${SSL_EMAIL}" \
-  --no-eff-email
-
-# 4. Reconfigurez Nginx avec HTTPS (copiez-collez le bloc HTTPS complet du script original)
-cat >/etc/nginx/sites-available/tazogil.duckdns.org <<'EOF'
-server {
-    listen 80;
-    listen [::]:80;
-    server_name tazogil.duckdns.org;
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-        allow all;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name tazogil.duckdns.org;
-
-    ssl_certificate     /etc/letsencrypt/live/tazogil.duckdns.org/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/tazogil.duckdns.org/privkey.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 1d;
-
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-
-    root /var/www/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ =404;
-    }
-
-    location /searx/ {
-        rewrite ^/searx/(.*)$ /$1 break;
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_buffering off;
-        proxy_request_buffering off;
-    }
-
-    location = /searx {
-        return 301 /searx/;
-    }
-}
-EOF
-
-sudo nginx -t && sudo systemctl reload nginx
-
-print_success "Nginx configuré"
-
-# ── 15. Certificats SSL ──────────────────────────────────
-print_info "Génération des certificats SSL..."
-
-certbot certonly --webroot \
-  -w /var/www/html \
-  -d "${DUCKDNS_DOMAIN}" \
-  --non-interactive \
-  --agree-tos \
-  --email "${SSL_EMAIL}" \
-  --no-eff-email
-
-systemctl enable certbot.timer 2>/dev/null || true
-systemctl start certbot.timer 2>/dev/null || true
-
-mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-cat >/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
-#!/bin/bash
-/usr/sbin/nginx -s reload
-EOF
-chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
-
-print_success "Certificats SSL générés"
-
-# ── 16. Page d'accueil ───────────────────────────────────
-cat >"${WWW_ROOT}/html/index.html" <<'EOF'
+# ── 17. Page d'accueil ───────────────────────────────────
+cat >"${WWW_ROOT}/html/index.html" <<EOF
 <!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -493,23 +509,36 @@ cat >"${WWW_ROOT}/html/index.html" <<'EOF'
 <body>
     <div class="container">
         <div class="emoji">👋</div>
-        <h1>Bienvenue chez Tazo Gil</h1>
-        <p>Accédez à <a href="https://$DOMAIN/searx">SEARX</a></p>
+        <h1>Bienvenue sur votre serveur</h1>
+        <p>Accédez à Searx via : <a href="https://${DUCKDNS_DOMAIN}/searx/">${DUCKDNS_DOMAIN}/searx/</a></p>
     </div>
 </body>
 </html>
 EOF
 
-sed -i "s/\$DOMAIN/${DUCKDNS_DOMAIN}/g" "${WWW_ROOT}/html/index.html"
 chown www-data:www-data "${WWW_ROOT}/html/index.html"
 print_success "Page d'accueil créée"
 
-# ── 17. Démarrage Searx ──────────────────────────────────
+# ── 18. Démarrage Searx ──────────────────────────────────
 cd "${PROJECT_DIR}/searxng"
 docker compose up -d
 print_success "Searx démarré"
 
-# ── 18. Résumé final ─────────────────────────────────────
+# ── 19. Mises à jour automatiques ────────────────────────
+cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+cat >/etc/cron.daily/docker-update <<'EOF'
+#!/bin/bash
+cd /opt/selfhost/searxng && docker compose pull && docker compose up -d
+EOF
+chmod +x /etc/cron.daily/docker-update
+
+# ── 20. Résumé final ─────────────────────────────────────
 LOCAL_IP=$(hostname -I | awk '{print $1}')
 
 echo ""
@@ -519,7 +548,7 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo -e "${CYAN}── ACCÈS AUX SERVICES ───────────────────────────────────${NC}"
 echo -e "  🏠 Page d'accueil :  https://${DUCKDNS_DOMAIN}"
-echo -e "  🔍 Searx          :  https://${DUCKDNS_DOMAIN}/searx"
+echo -e "  🔍 Searx          :  https://${DUCKDNS_DOMAIN}/searx/"
 echo ""
 echo -e "${CYAN}── ACCÈS SSH ────────────────────────────────────────────${NC}"
 echo -e "  Commande : ssh ${REAL_USER}@${DUCKDNS_DOMAIN}"
@@ -529,4 +558,4 @@ echo -e "  Logs Searx       : docker compose -f /opt/selfhost/searxng/docker-com
 echo -e "  Redémarrer Searx : docker compose -f /opt/selfhost/searxng/docker-compose.yml restart"
 echo -e "  Renouveler SSL   : sudo certbot renew"
 echo ""
-print_success "Script terminé. Bonne utilisation !"
+print_success "Script terminé. Bonne utilisation !"rint_success "Script terminé. Bonne utilisation !"
