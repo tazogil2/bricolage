@@ -1,141 +1,177 @@
-# Auto-heberger Searx sur un Raspberry
+# Auto-hébergement SearXNG + Linkding + RSS-Bridge sur Raspberry Pi
 
 ## ⚠️ Avant toute installation
 
 Vérifiez si votre FAI vous attribue une vraie adresse IP publique ou s'il utilise le CGNAT (Carrier-Grade NAT).
 
-Test rapide : Allez sur [whatismyip.com](https://whatismyip.com) depuis votre ordinateur connecté au même réseau. Comparez cette IP avec celle affichée dans l'interface de votre box internet.
+Test rapide : sur le Pi, exécutez `curl api.ipify.org` et comparez avec l'IP affichée sur whatismyip.com depuis votre ordinateur.
 
-Si elles sont identiques : Vous avez une IP publique. Vous pourrez utiliser le Port Forwarding (méthode standard).
+- **Identiques** : vous avez une IP publique, le port forwarding fonctionnera.
+- **Différentes** (ou commençant par `100.64.x.x`) : CGNAT — les redirections de ports sont inopérantes depuis l'extérieur. Solutions possibles : IPv6 native, ou tunnel (Cloudflare).
 
-Si elles sont différentes (ou commençant par 100.x.x.x) : Vous êtes derrière le CGNAT. Le port forwarding classique ne fonctionnera pas, votre FAI interdit cette solution d'Auto-hébergement.
+Ce script déploie un serveur personnel hébergeant **SearXNG** (moteur de recherche privé), **Linkding** (gestionnaire de signets), **RSS-Bridge** (générateur de flux RSS) et un espace pour des pages statiques (blog MkDocs). Tout le trafic passe par Nginx en HTTPS avec des certificats Let's Encrypt.
 
-Ce guide permet d'installer un serveur personnel abritant Searx (moteur de recherche privé), Linkding (gestionnaire de signets) et un espace pour des pages statiques (blog). Tout est automatisé via un script bash pour les utilisateurs débutants.
+## 🏗️ Architecture
 
-## 📋 1. Prérequis Matériels et Logiciels
+```
+Internet ──► Box (redirection 80/443) ──► Raspberry Pi
+                                            │
+                              UFW (22/80/443 uniquement)
+                                            │
+                                       Nginx (reverse proxy)
+                   ┌──────────────┬───────────────┬──────────────┐
+                   │              │               │              │
+            jolicoco.duckdns.org  sx.       ld.           rb.
+              (site statique)   (SearXNG)  (Linkding)  (RSS-Bridge)
+                   │              │            │              │
+                   └──── /var/www/html ── 127.0.0.1:8080 :9090 :8081
+                                    (conteneurs Docker, jamais exposés directement)
+```
 
-Avant de commencer, assurez-vous d'avoir le matériel suivant :
+Points clés du design :
 
-  | Composant |  Spécifications  recommandées | Notes | 
- |-----  |-----  |-----  | 
-  | Raspberry Pi  | Modèle 4B ou supérieur (4 Go RAM recommandé)  |  Les modèles Zéro 2 W peuvent fonctionner mais seront plus lents. |
-  | Carte SD  | Minimum 16 Go, Classe 10 / UHS-I  | Qualité indispensable pour la durée de vie du système.  |
-  | Alimentation | Alimentation officielle Raspberry Pi USB-C | Évitez les chargeurs de téléphone instables. |
-  | Stockage externe | Clé USB ou SSD avec format ext4 | Servira à stocker les données (/var/www) pour faciliter les sauvegardes. | 
-  | Réseau | Câble Ethernet (recommandé) ou Wi-Fi stable | Le câble évite les coupures pendant l'installation. |   
-| Budget | ~150 € (si vous n'avez pas le matériel) | Inclut le Pi, la carte, l'alim et le stockage USB. | 
+- **Un seul certificat SAN** couvrant les 4 noms de domaine (renouvellement unique).
+- **Ports Docker liés à 127.0.0.1** : les services ne sont joignables que via Nginx — double barrière avec UFW.
+- **Système sur SSD** : le script refuse de s'exécuter si le Pi démarre sur la carte SD.
+- **Configurations Nginx séparées** : un fichier par service (`apex`, `searx`, `linkding`, `rssbridge`) + snippets réutilisables.
 
+## 📋 1. Prérequis matériels
 
-## 🛠️ 2. Préparation Environnementale (AVANT l'installation)
+| Composant | Spécifications recommandées | Notes |
+|-----|-----|-----|
+| Raspberry Pi | Modèle 4B ou supérieur (4 Go RAM) | Les modèles Zero 2 W fonctionnent mais seront plus lents |
+| SSD + boîtier USB 3.0 | 128 Go minimum, boîtier **UASP** (ASM1153E, JMS578/583) | Système ET données sur le SSD |
+| Alimentation | Alimentation officielle USB-C (5,1 V / 3 A) | Icône éclair jaune = sous-tension → hub USB alimenté |
+| Réseau | Câble Ethernet (recommandé) | Évite les coupures pendant l'installation |
+| Budget | ~150 € (si départ de zéro) | Pi, SSD, boîtier, alimentation |
 
-Ces étapes doivent être réalisées sur votre ordinateur principal (Mac, Windows ou Linux) avant de toucher au Raspberry Pi.
+## 🛠️ 2. Préparation de l'environnement (AVANT le script)
 
-### A. Création des clés SSH
+### A. Migration vers le SSD
 
-Nous utilisons l'authentification par clé pour plus de sécurité.ssh-keygen -t ed25519 -C "votre_email@exemple.com"Conseil : Pour ce projet, nous partirons sur une clé sans phrase de passe (empty passphrase) pour faciliter l'usage par des débutants.
+Le système doit démarrer sur le SSD, pas sur la carte SD :
 
-### B. Configuration DuckDNS
+1. Mettre à jour le firmware : `sudo rpi-eeprom-update -a` puis redémarrer.
+2. `sudo raspi-config` → *Advanced Options* → *Boot Order* → **USB Boot**.
+3. Cloner la SD vers le SSD : outil **SD Card Copier** (graphique) ou `dd`.
+4. Étendre le système de fichiers : *Advanced Options* → *Expand Filesystem*.
+5. Retirer la SD et redémarrer. Vérification : `findmnt -n -o SOURCE /` doit afficher `/dev/sda*`, pas `/dev/mmcblk*`.
 
-Vous aurez besoin d'un nom de domaine pour accéder à vos services.
+La carte SD conservée devient une roue de secours bootable.
 
-Inscrivez-vous sur [DuckDNS.org](https://duckdns.org) (connexion possible avec Google, Github, Twitter, etc.). DuckDNS a été choisi parmi d'autres services similaires (freeDNS, No-IP).
+### B. Clé SSH
 
-1. Créez un domaine (ex: mon-projet.duckdns.org).
-2. Notez le token affiché sur la page — il sera demandé plus tard.
+```bash
+ssh-keygen -t ed25519 -C "votre_email@exemple.com"
+```
 
-### C. Installation de l'OS sur la Carte SD
+L'authentification par clé est obligatoire : le script désactive l'authentification SSH par mot de passe.
 
-1. Téléchargez et lancez Raspberry Pi Imager.
-2. Choisissez le système : Raspberry Pi OS (64-bit) LITE.
-3. Cliquez sur "Configurer les options" (la roue dentée) :
+### C. DuckDNS
 
-      *   Nom d'hôte : rpi-services
-      *   Compte utilisateur : Choisissez un nom court (ex: admin) et définissez un mot de passe fort.
-      *   SSH : Activez-le. Sélectionnez "Utiliser la clé SSH" et collez la clé publique générée à l'étape A.
-      *   Paramètres régionaux : Fuseau horaire sur Europe/Paris, clavier Français.
+1. Créez un domaine sur [duckdns.org](https://duckdns.org) (ex: `mon-projet`).
+2. Notez le **token** affiché sur la page.
+3. Le wildcard `*.mon-projet.duckdns.org` est automatique : les sous-domaines `sx.`, `ld.`, `rb.` résolvent sans configuration supplémentaire. Testez : `ping sx.mon-projet.duckdns.org`.
 
-4. Écrivez l'image sur la carte SD.
+### D. Configuration de la box
 
-## 🚀 3. Installation Physique et Réseau
+1. **Bail DHCP fixe** : associez l'adresse MAC du Pi à une IP locale permanente.
+2. **Redirection de ports** : TCP 80 et TCP 443 vers l'IP locale du Pi.
+3. ⚠️ Constatez que le Pi apparaît sous son ancien nom dans la box ? C'est un cache DHCP, sans importance — forcez un renouvellement de bail si cela vous chiffonne.
 
-1. Insérez la carte SD dans le Raspberry Pi.
-1. Branchez la clé USB (stockage externe) sur un port USB libre.
-1. Connectez le Pi au routeur via Ethernet.
-1. Branchez l'alimentation.
-1. Attendez 2 minutes que le système démarre.
+## 🚀 3. Installation
 
-Configuration du Routeur (Box Internet)
+Depuis votre ordinateur :
 
-Connectez-vous à l'interface d'administration de votre box (généralement 192.168.1.1 ou 192.168.0.1).
+```bash
+scp auto-host-searx-raspberry.sh <UTIL>@<IP-du-Pi>:~
+ssh <UTIL>@<IP-du-Pi>
+chmod 700 auto-host-searx-raspberry.sh
+sudo bash auto-host-searx-raspberry.sh
+```
 
-Trouvez l'adresse IP du Pi : Dans la liste des appareils connectés, repérez rpi-services et notez son adresse IP locale (ex: 192.168.1.45).
+Le script effectue dans l'ordre :
 
-Réservation DHCP (IP Statique) : Associez l'adresse MAC du Pi à cette IP pour qu'elle ne change jamais.
+1. Vérifie le démarrage sur SSD (refuse la carte SD).
+2. Met à jour le système et installe les dépendances (dont `python3-systemd`, requis par fail2ban).
+3. Installe Docker.
+4. Configure la mise à jour DuckDNS (cron toutes les 5 minutes).
+5. Vérifie que le wildcard DNS résout.
+6. Sécurise SSH (clé uniquement — gardez une session de secours ouverte !).
+7. Configure UFW (22/80/443 uniquement).
+8. Démarre les 3 conteneurs (liés à 127.0.0.1).
+9. Configure Nginx + obtient le certificat SAN Let's Encrypt (4 domaines).
+10. Active fail2ban (sshd + nginx-botsearch).
+11. Configure les mises à jour automatiques.
 
-Redirection de Ports (Port Forwarding) : Créez des règles pour rediriger le trafic entrant vers l'IP du Pi :
+**Point de vigilance** : le script s'interrompt pour un test manuel — depuis l'extérieur (4G/5G), `http://sx.<domaine>.duckdns.org/.well-known/acme-challenge/test` doit retourner un **404 nginx** avant que le certificat ne soit demandé. Sinon, corrigez les redirections de la box d'abord.
 
-- Port 22 (SSH) → Vers le Pi (Port 22)
-- Port 80 (HTTP) → Vers le Pi (Port 80)
-- Port 443 (HTTPS) → Vers le Pi (Port 443)
+## ✅ 4. Vérifications finales
 
-## 💻 4. Déploiement du Script
+| Service | URL |
+|-----|-----|
+| Site statique | https://\<domaine\>.duckdns.org |
+| SearXNG | https://sx.\<domaine\>.duckdns.org |
+| Linkding | https://ld.\<domaine\>.duckdns.org |
+| RSS-Bridge | https://rb.\<domaine\>.duckdns.org |
 
-⚠️   Connectez-vous au Raspberry avec le même ordinateur qui a servi à flasher la carte SD car le flashage a copié sur le Raspberry seulement la clé publique créée sur cet ordinateur.
+Tests de santé :
 
-1. Téléchargez l'archive zip contenant le script ici : [github.com/tazogil2/bricolage](https://github.com/tazogil2/bricolage). Appuyez sur le bouton vert *code* pour accéder à l'archive. Décompactez l'archive, ouvrez le dossier "bricolage-main" et copiez son chemin d'accès.
+```bash
+sudo certbot renew --dry-run     # renouvellement SSL
+sudo fail2ban-client status      # jails actives
+docker compose -f /opt/selfhost/docker-compose.yml ps
+```
 
-2. Ouvrez un terminal sur votre ordinateur principal et exécutez les commandes suivantes :
+Les identifiants Linkding sont générés aléatoirement et stockés dans `/opt/selfhost/linkding/ADMIN_CREDENTIALS.txt` (permissions 600).
 
-        cd <LE CHEMIN QUE VOUS VENEZ DE COPIER>
+## 🔒 5. Sécurité
 
-1. Transférer le script, remplacez <UTIL> par votre nom d'utilisateur et <IP> par l'IP locale du Pi.
+- **SSH par clé uniquement**, mot de passe désactivé (fail2ban surveille les tentatives).
+- **UFW** : seuls les ports 22 (SSH), 80 et 443 (Nginx) sont ouverts.
+- **fail2ban** : jails `sshd` (backend systemd) et `nginx-botsearch` (bantime 1 h).
+- **Conteneurs cloisonnés** : ports Docker sur 127.0.0.1, cap_drop ALL, limites mémoire.
+- **HTTPS partout** : redirection 301, HSTS, TLS 1.2/1.3 uniquement.
+- **Mises à jour automatiques** : unattended-upgrades (système) + cron quotidien (images Docker).
 
-        scp auto-host-searx-raspberry.sh <UTIL>@<IP>:~
+## 👥 6. Collaboration sur le site statique
 
-2. Se connecter au Pi
+Plusieurs utilisateurs peuvent déployer dans `/var/www/html` via un groupe partagé :
 
-        ssh <UTIL>@<IP>
+```bash
+sudo groupadd web
+sudo usermod -aG web stef
+sudo adduser --ingroup web camille    # nouveau collaborateur
+sudo chown -R stef:web /var/www/html
+sudo find /var/www/html -type d -exec chmod 2775 {} \;
+sudo find /var/www/html -type f -exec chmod 664 {} \;
+```
 
-3. Rendre le script exécutable et lancer l'installation
+- Le bit **setgid** (2775) fait hériter le groupe `web` à tout nouveau fichier.
+- Les scripts de déploiement rsync doivent utiliser `--chmod=D2775,F664` pour garantir les droits indépendamment de l'umask (rsync `-a` écrase sinon les permissions).
+- Nginx (`www-data`) n'a besoin que de la lecture : il reste satisfait avec ces permissions.
+- Dépôt de clé SSH pour un nouvel utilisateur : `ssh-copy-id -i id_ed25519.pub camille@<domaine>` (ou copie manuelle en root, puis `chown -R camille: /home/camille/.ssh`, `chmod 700` sur le dossier et `600` sur `authorized_keys`).
 
-        chmod 700 auto-host-searx-raspberry.sh
-        ./auto-host-searx-raspberry.sh
+## 🆘 7. Dépannage
 
-Suivez les instructions à l'écran. Le script va :
+| Problème | Solution |
+|----|----|
+| Impossible de se connecter en SSH | Clé publique bien copiée ? Session de secours disponible ? Vérifier fail2ban : `sudo fail2ban-client status sshd` |
+| Sites inaccessibles depuis l'extérieur | Redirections box (80/443) actives ? CGNAT ? Test : `curl api.ipify.org` vs whatismyip.com |
+| `ERR_CONNECTION_RESET` en mobile | Souvent le navigateur qui tente HTTPS alors que le 443 n'est pas encore configuré ; tester en `http://` explicite |
+| Le certificat SSL échoue | Le test 404 ACME externe passe-t-il ? `http://<domaine>/.well-known/acme-challenge/test` doit donner un 404 nginx |
+| fail2ban ne démarre pas | `sudo fail2ban-client -t` pour la ligne fautive ; un seul `logpath` par jail ; vérifier `python3-systemd` |
+| `docker` exige sudo | Se déconnecter/reconnecter après l'ajout au groupe docker |
+| Searx ne répond pas | `docker compose -f /opt/selfhost/docker-compose.yml logs -f searxng` |
+| `nginx -t` : Permission denied sur les certificats | Lancer avec `sudo` (les clés live/ sont en 700 root) |
+| Hook deploy-hook certbot affiché en rouge | Sortie normale de `nginx -s reload` coloriée par certbot — ignorable si « Successfully received certificate » suit |
+| Écriture impossible dans /var/www/html | Vérifier groupe `web` + setgid + permissions (voir section 6) |
 
-1. Vérifier et monter la clé USB sur /var/www.
-2. Installer Docker, Nginx, Fail2Ban et UFW.
-3. Demander votre token DuckDNS et configurer les certificats SSL.
-5. Sécuriser l'accès SSH et activer le pare-feu.
+## 📝 Historique des versions
 
-## ✅ 5. Vérifications Finales
+- **v2.0** (2026-10-17) : refonte complète — système sur SSD obligatoire, 3 services (SearXNG, Linkding, RSS-Bridge), sous-domaines wildcard, certificat SAN unique, vhosts séparés, fail2ban. Correctifs issus d'une installation réelle pas-à-pas : `python3-systemd` explicite, jail `nginx-badbots` supprimée (absente de fail2ban 1.1.0), `logpath` unique par jail, validation `fail2ban-client -t` préalable, syntaxe `http2 on;`, test ACME externe avant certbot, message de reconnexion groupe docker.
+- **v1.0** (2026-08-10) : SearXNG seul sur chemin `/searx/`, formatage automatique de la clé USB.
 
-Une fois le script terminé :
+---
 
-|  Service | URL |
-|  -----|  -----|  
-| Recherche|  https://<votre-domaine>.duckdns.org/searx| 
-|  Blog|  https://<votre-domaine>.duckdns.org| 
-|  Connexion SSH | ssh <UTIL>@<votre-domaine>.duckdns.org| 
-
-## 🔒 6. Sécurité et Maintenance
-
-Mises à jour automatiques : Le script configure unattended-upgrades pour le système et des tâches cron pour Docker.
-
-Sauvegarde : Comme /var/www est sur la clé USB, vous pouvez simplement débrancher la clé et la brancher sur un autre PC Linux pour récupérer vos données.
-
-Phrase de passe SSH : Bien que l'installation ait utilisé une clé sans passe, il est fortement recommandé de protéger votre clé privée par une phrase de passe dès que possible.
-
-Pour changer la phrsa de passe : 
-
-    ssh-keygen -p -f ~/.ssh/id_ed25519
-
-Pour gérer la saisie automatique : Configurez ssh-agent (voir annexe).
-
-## 🆘 Annexe : Dépannage
-| Problème| Solution|
-|----|----|   
-| Impossible de se connecter en SSH| Vérifiez que la clé publique a bien été copiée dans Imager et que le port 22 est redirigé.|
-| Les sites web sont inaccessible| Vérifiez que les ports 80 et 443 sont redirigés et que DuckDNS pointe vers votre IP publique.|
-| Le certificat SSL échoue| Vérifiez que le port 80 est accessible depuis Internet (test avec un outil en ligne).|
-| Searx ne répond pas| Consultez les logs : docker compose logs searxng| 
+*Auteur : tazogil2 assisté de Lumo — Projet bricolage*
